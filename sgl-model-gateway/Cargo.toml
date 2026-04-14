@@ -164,6 +164,9 @@ name = "manual_policy_benchmark"
 harness = false
 path = "benches/manual_policy_benchmark.rs"
 
+[patch.crates-io]
+openai-protocol = { git = "https://github.com/DavidBellamy/smg.git", branch = "add-flatten-chat-completion-request" }
+
 [profile.release]
 opt-level = "z"     # Optimize for size
 lto = "fat"         # Full LTO for smaller binaries
