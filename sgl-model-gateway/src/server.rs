@@ -431,6 +431,41 @@ async fn create_worker(
     }
 }
 
+#[derive(Deserialize)]
+struct MilesAddWorkerQuery {
+    url: String,
+}
+
+/// Miles-router API compatibility shim: accepts worker URL via `url` query
+/// parameter (instead of JSON body) and returns `{"status": "ok"}`.
+async fn miles_add_worker(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<MilesAddWorkerQuery>,
+) -> Response {
+    let config = WorkerConfigRequest {
+        url: query.url,
+        ..Default::default()
+    };
+    match state.context.worker_service.create_worker(config).await {
+        Ok(_) => (StatusCode::OK, Json(json!({"status": "ok"}))).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// Miles-router API compatibility shim: returns `{"urls": [...]}` sourced
+/// from the worker registry so the Miles rollout orchestrator can continue
+/// calling the gateway with its existing `GET /list_workers` expectation.
+async fn miles_list_workers(State(state): State<Arc<AppState>>) -> Response {
+    let urls: Vec<String> = state
+        .context
+        .worker_registry
+        .get_all()
+        .iter()
+        .map(|w| w.url().to_string())
+        .collect();
+    (StatusCode::OK, Json(json!({"urls": urls}))).into_response()
+}
+
 async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
     state.context.worker_service.list_workers().into_response()
 }
@@ -639,6 +674,11 @@ pub fn build_app(
 
     // Build worker routes
     let worker_routes = Router::new()
+        // Miles-router API compatibility shim: these two routes keep the
+        // existing Miles rollout client working unchanged while the native
+        // /workers routes are the long-term API.
+        .route("/add_worker", post(miles_add_worker))
+        .route("/list_workers", get(miles_list_workers))
         .route("/workers", post(create_worker).get(list_workers_rest))
         .route(
             "/workers/{worker_id}",
