@@ -76,7 +76,7 @@ validator = { version = "0.20.0", features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
 reasoning-parser = "=1.0.0"
-openai-protocol = { version = "=1.0.0", features = ["axum"] }
+openai-protocol = { git = "https://github.com/DavidBellamy/smg.git", branch = "add-flatten-chat-completion-response", features = ["axum"] }
 tool-parser = "=1.0.0"
 llm-tokenizer = "=1.0.0"
 smg-auth = "=1.0.0"
@@ -165,7 +165,7 @@ harness = false
 path = "benches/manual_policy_benchmark.rs"
 
 [patch.crates-io]
-openai-protocol = { git = "https://github.com/DavidBellamy/smg.git", branch = "add-flatten-chat-completion-response" }
+# openai-protocol is now a direct git dep above; no patch needed here.
 
 [profile.release]
 opt-level = "z"     # Optimize for size
