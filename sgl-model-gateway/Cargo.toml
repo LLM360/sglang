@@ -76,7 +76,7 @@ validator = { version = "0.20.0", features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
 reasoning-parser = "=1.0.0"
-openai-protocol = { git = "https://github.com/DavidBellamy/smg.git", branch = "add-flatten-chat-completion-response", features = ["axum"] }
+openai-protocol = { git = "https://github.com/lightseekorg/smg.git", branch = "main", features = ["axum"] }
 tool-parser = "=1.0.0"
 llm-tokenizer = "=1.0.0"
 smg-auth = "=1.0.0"
