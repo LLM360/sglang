@@ -438,14 +438,30 @@ struct MilesAddWorkerQuery {
 
 /// Miles-router API compatibility shim: accepts worker URL via `url` query
 /// parameter (instead of JSON body) and returns `{"status": "ok"}`.
+///
+/// Uses `serde_json::from_value` to construct the `WorkerConfigRequest` from
+/// a minimal `{"url": ...}` object so the struct's `#[serde(default)]`
+/// annotations fill in every other field. This keeps the shim resilient to
+/// upstream field additions on `WorkerConfigRequest` (it does not implement
+/// `Default`, and adding each field here would make the shim brittle).
 async fn miles_add_worker(
     State(state): State<Arc<AppState>>,
     Query(query): Query<MilesAddWorkerQuery>,
 ) -> Response {
-    let config = WorkerConfigRequest {
-        url: query.url,
-        ..Default::default()
-    };
+    let config: WorkerConfigRequest =
+        match serde_json::from_value(json!({ "url": query.url })) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "status": "error",
+                        "message": format!("invalid worker config: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
     match state.context.worker_service.create_worker(config).await {
         Ok(_) => (StatusCode::OK, Json(json!({"status": "ok"}))).into_response(),
         Err(err) => err.into_response(),
