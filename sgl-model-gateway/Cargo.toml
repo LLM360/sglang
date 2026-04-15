@@ -165,7 +165,7 @@ harness = false
 path = "benches/manual_policy_benchmark.rs"
 
 [patch.crates-io]
-openai-protocol = { git = "https://github.com/DavidBellamy/smg.git", branch = "add-flatten-chat-completion-request" }
+openai-protocol = { git = "https://github.com/DavidBellamy/smg.git", branch = "add-flatten-chat-completion-response" }
 
 [profile.release]
 opt-level = "z"     # Optimize for size
