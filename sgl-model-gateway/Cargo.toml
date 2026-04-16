@@ -165,15 +165,11 @@ harness = false
 path = "benches/manual_policy_benchmark.rs"
 
 [patch.crates-io]
-openai-protocol = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
-smg-auth = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
-smg-mcp = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
-smg-mesh = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
-smg-wasm = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
-smg-grpc-client = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
-reasoning-parser = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
-llm-tokenizer = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
-tool-parser = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
+# Narrow fix: crates.io openai-protocol 1.0.0 + serde(flatten) backport of
+# lightseekorg/smg#1130. Keeps everything else identical to 1.0.0 so the
+# gateway's source does not hit the smg 1.7.0 API drift (worker_spec -> worker,
+# WorkerConfigRequest -> WorkerSpec, etc).
+openai-protocol = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-flatten-1.0.0" }
 
 [profile.release]
 opt-level = "z"     # Optimize for size
