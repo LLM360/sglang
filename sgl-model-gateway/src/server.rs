@@ -434,34 +434,80 @@ async fn create_worker(
 #[derive(Deserialize)]
 struct MilesAddWorkerQuery {
     url: String,
+    /// Optional: "prefill" | "decode" | "regular" (or omitted = regular).
+    /// Mirrors the field that Miles sends on /add_worker once upstream
+    /// miles#990 lands (which relaxed the client-side assertion that
+    /// previously forced worker_type to "regular" on this endpoint).
+    worker_type: Option<String>,
+    /// Optional: only valid for prefill workers in PD disaggregation mode.
+    bootstrap_port: Option<u16>,
 }
 
 /// Miles-router API compatibility shim: accepts worker URL via `url` query
 /// parameter (instead of JSON body) and returns `{"status": "ok"}`.
 ///
+/// Also accepts optional `worker_type` and `bootstrap_port` query params so
+/// PD disaggregation workers registered from Miles (after miles#990) reach
+/// the same create_worker service with the right worker_type set. A
+/// missing/empty/"regular" worker_type is equivalent to the original
+/// regular-only behavior.
+///
 /// Uses `serde_json::from_value` to construct the `WorkerConfigRequest` from
-/// a minimal `{"url": ...}` object so the struct's `#[serde(default)]`
-/// annotations fill in every other field. This keeps the shim resilient to
-/// upstream field additions on `WorkerConfigRequest` (it does not implement
-/// `Default`, and adding each field here would make the shim brittle).
+/// a minimal object so the struct's `#[serde(default)]` annotations fill in
+/// every other field. This keeps the shim resilient to upstream field
+/// additions on `WorkerConfigRequest` (it does not implement `Default`, and
+/// adding each field here would make the shim brittle).
 async fn miles_add_worker(
     State(state): State<Arc<AppState>>,
     Query(query): Query<MilesAddWorkerQuery>,
 ) -> Response {
-    let config: WorkerConfigRequest =
-        match serde_json::from_value(json!({ "url": query.url })) {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "status": "error",
-                        "message": format!("invalid worker config: {e}"),
-                    })),
-                )
-                    .into_response();
+    // Build a minimal JSON payload that exactly mirrors what the
+    // service_discovery path sends for each worker role. `worker_type` is
+    // Option<String> with value "prefill"|"decode"|None in upstream
+    // WorkerConfigRequest (see src/service_discovery.rs:433); bootstrap_port
+    // is a sibling Option<u16>, not nested inside worker_type.
+    let mut body = json!({ "url": query.url });
+    match query.worker_type.as_deref() {
+        Some("prefill") => {
+            body["worker_type"] = json!("prefill");
+            if let Some(bp) = query.bootstrap_port {
+                body["bootstrap_port"] = json!(bp);
             }
-        };
+        }
+        Some("decode") => {
+            body["worker_type"] = json!("decode");
+        }
+        Some("regular") | None | Some("") => {
+            // Default behavior: regular worker. Omit worker_type so
+            // serde default fills in None.
+        }
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "status": "error",
+                    "message": format!(
+                        "invalid worker_type: {other:?} (expected prefill|decode|regular)"
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let config: WorkerConfigRequest = match serde_json::from_value(body) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "status": "error",
+                    "message": format!("invalid worker config: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
     match state.context.worker_service.create_worker(config).await {
         Ok(_) => (StatusCode::OK, Json(json!({"status": "ok"}))).into_response(),
         Err(err) => err.into_response(),
