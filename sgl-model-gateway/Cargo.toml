@@ -166,6 +166,14 @@ path = "benches/manual_policy_benchmark.rs"
 
 [patch.crates-io]
 openai-protocol = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
+smg-auth = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
+smg-mcp = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
+smg-mesh = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
+smg-wasm = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
+smg-grpc-client = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
+reasoning-parser = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
+llm-tokenizer = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
+tool-parser = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-patch-1.0.0" }
 
 [profile.release]
 opt-level = "z"     # Optimize for size
