@@ -572,9 +572,45 @@ class MooncakeKVManager(CommonKVManager):
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
-            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
-        )
+        # Retry transient transfer failures before returning non-zero. Upstream
+        # sglang increments session_failures on any ret != 0 and the default
+        # kill threshold is low, so a single transient error permakills the
+        # session. Mooncake itself has per-slice retries for WC errors but not
+        # for handshake RPC failures / endpoint resets under load; this catches
+        # those. Defaults: 3 attempts, 50ms backoff. Knobs:
+        #   SGLANG_DISAGG_TRANSFER_RETRIES (int, default 3)
+        #   SGLANG_DISAGG_TRANSFER_RETRY_BACKOFF_MS (int, default 50)
+        max_retries = int(os.environ.get("SGLANG_DISAGG_TRANSFER_RETRIES", "3"))
+        backoff_ms = int(os.environ.get("SGLANG_DISAGG_TRANSFER_RETRY_BACKOFF_MS", "50"))
+        import time as _time
+        ret = 0
+        for attempt in range(max_retries):
+            ret = self.engine.batch_transfer_sync(
+                mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+            )
+            if ret == 0:
+                if attempt > 0:
+                    logger.warning(
+                        f"batch_transfer_sync recovered on retry {attempt} for session {mooncake_session_id}"
+                    )
+                return 0
+            if attempt < max_retries - 1:
+                _time.sleep(backoff_ms / 1000.0)
+        # On persistent failure, log enough context to diagnose.
+        try:
+            _first_src = list(src_addrs)[0]
+            _first_dst = list(dst_addrs)[0]
+            _total_bytes = sum(list(lengths))
+            _n_slices = len(list(lengths))
+            logger.error(
+                f"PD_TRANSFER_FAIL session={mooncake_session_id} ret={ret} "
+                f"n_slices={_n_slices} total_bytes={_total_bytes} "
+                f"first_src=0x{_first_src:x} first_dst=0x{_first_dst:x} "
+                f"first_len={list(lengths)[0]}"
+            )
+        except Exception as _e:
+            logger.error(f"PD_TRANSFER_FAIL session={mooncake_session_id} ret={ret} (instrumentation error: {_e})")
+        return ret
 
     def _send_kvcache_generic(
         self,
