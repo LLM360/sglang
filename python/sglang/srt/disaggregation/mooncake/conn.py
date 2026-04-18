@@ -1302,8 +1302,12 @@ class MooncakeKVManager(CommonKVManager):
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
+                                # Mark the session dead once it accumulates enough failures.
+                                # Threshold is configurable via SGLANG_DISAGG_SESSION_FAILURE_THRESHOLD
+                                # (default 10) so transient failures retried by the transfer loop
+                                # above do not immediately permakill the session.
+                                _threshold = int(os.environ.get("SGLANG_DISAGG_SESSION_FAILURE_THRESHOLD", "10"))
+                                if self.session_failures[req.mooncake_session_id] >= _threshold:
                                     self.failed_sessions.add(req.mooncake_session_id)
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
