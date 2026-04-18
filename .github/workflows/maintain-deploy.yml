@@ -11,7 +11,7 @@ on:
         default: false
 
 env:
-  UPSTREAM: sgl-project/sglang
+  UPSTREAM: LLM360/sglang
 
 jobs:
   check:
@@ -28,16 +28,16 @@ jobs:
           FORCE: ${{ inputs.force }}
           REPO: ${{ github.repository }}
         run: |
-          UPSTREAM_SHA=$(gh api "repos/${UPSTREAM}/commits/main" --jq '.sha' 2>/dev/null || echo "unknown")
+          UPSTREAM_SHA=$(gh api "repos/${UPSTREAM}/commits/llm360-main" --jq '.sha' 2>/dev/null || echo "unknown")
 
           FORK_OWNER="${REPO%%/*}"
           NOT_BLOCKED='select(([.labels[].name] | index("blocked")) == null)'
 
           # Branches with open PRs against upstream (no blocked filter; upstream PRs always merge)
-          UPSTREAM_PR_STATE=$(gh api "repos/${UPSTREAM}/pulls?state=open&base=main&per_page=100" \
+          UPSTREAM_PR_STATE=$(gh api "repos/${UPSTREAM}/pulls?state=open&base=llm360-main&per_page=100" \
             --jq "[.[] | select(.head.repo.owner.login == \"${FORK_OWNER}\")] | sort_by(.head.ref) | map(.head.ref + \"=\" + .head.sha) | join(\",\")")
 
-          UPSTREAM_BRANCHES=$(gh api "repos/${UPSTREAM}/pulls?state=open&base=main&per_page=100" \
+          UPSTREAM_BRANCHES=$(gh api "repos/${UPSTREAM}/pulls?state=open&base=llm360-main&per_page=100" \
             --jq "[.[] | select(.head.repo.owner.login == \"${FORK_OWNER}\")] | .[].head.ref" | tr '\n' ' ')
 
           # Branches with open PRs against the fork's own llm360-main (fork-only changes), excluding blocked PRs
@@ -104,14 +104,14 @@ jobs:
       - name: Fetch upstream
         run: |
           git remote add upstream "https://github.com/${UPSTREAM}.git" || true
-          git fetch upstream main
+          git fetch upstream llm360-main
           git fetch origin
 
       - name: Build deploy branch
         env:
           PR_BRANCHES: ${{ needs.check.outputs.branches }}
         run: |
-          git checkout -B deploy upstream/main
+          git checkout -B deploy upstream/llm360-main
 
           MERGED=""
           FAILED=""
