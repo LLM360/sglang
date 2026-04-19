@@ -164,6 +164,13 @@ name = "manual_policy_benchmark"
 harness = false
 path = "benches/manual_policy_benchmark.rs"
 
+[patch.crates-io]
+# Narrow fix: crates.io openai-protocol 1.0.0 + serde(flatten) backport of
+# lightseekorg/smg#1130. Keeps everything else identical to 1.0.0 so the
+# gateway's source does not hit the smg 1.7.0 API drift (worker_spec -> worker,
+# WorkerConfigRequest -> WorkerSpec, etc).
+openai-protocol = { git = "https://github.com/DavidBellamy/smg.git", branch = "gateway-flatten-1.0.0" }
+
 [profile.release]
 opt-level = "z"     # Optimize for size
 lto = "fat"         # Full LTO for smaller binaries
