@@ -1407,6 +1407,18 @@ class InitWeightsUpdateGroupReqInput(BaseReq):
     group_name: str = "weight_update_group"
     # The backend
     backend: str = "nccl"
+    # The transport stack used to bring up the side group:
+    #   - "torch_dist" (default): the legacy path. init_custom_process_group
+    #     constructs a torch.distributed ProcessGroup; the NCCL communicator
+    #     is bound to whichever libnccl.so PyTorch was linked against. Caller
+    #     ranks must all run the same NCCL version.
+    #   - "pynccl": StatelessProcessGroup (TCPStore-backed metadata channel)
+    #     + PyNcclCommunicator. PyNcclCommunicator dlopens libnccl via ctypes
+    #     and is independent of the libnccl PyTorch is linked against, so the
+    #     side group can run on a different NCCL version than the engine's
+    #     main TP collective. Set SGLANG_NCCL_SO_PATH at engine launch to
+    #     point at the libnccl.so to use for the side group.
+    transport: str = "torch_dist"
 
 
 @dataclass

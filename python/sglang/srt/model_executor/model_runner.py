@@ -1609,8 +1609,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         world_size,
         group_name,
         backend="nccl",
+        transport="torch_dist",
     ):
-        """Initialize the Torch process group for model parameter updates.
+        """Initialize the side process group for model parameter updates.
 
         `_model_update_group` is used in the RLHF workflow, where rank
         0 is the actor model in the training engine, and the other ranks are
@@ -1619,20 +1620,60 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         In the RLHF workflow, the training engine updates the model
         weights/parameters online, and broadcasts them to the inference
         engine through the `_model_update_group` process group.
+
+        Two transports:
+
+          - "torch_dist" (default, legacy): construct a torch.distributed
+            ProcessGroup via init_custom_process_group. The NCCL communicator
+            is bound to the libnccl PyTorch was linked against; every
+            participant must run the same NCCL version.
+
+          - "pynccl": StatelessProcessGroup (TCPStore-backed metadata channel,
+            independent of torch.distributed's global state) +
+            PyNcclCommunicator (ctypes-dlopen of libnccl, configurable via
+            SGLANG_NCCL_SO_PATH env at engine launch). Lets the side group
+            run a different NCCL version than the engine's main TP collective,
+            for cross-image RL deployments where trainer and inference ship
+            with different libnccl.so versions.
         """
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
         assert group_name != "", "Group name cannot be empty"
 
         rank = rank_offset + self.tp_rank
 
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
-            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
+            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, "
+            f"group_name={group_name}, backend={backend}, transport={transport}"
         )
 
         try:
+            if transport == "pynccl":
+                from sglang.srt.distributed.device_communicators.pynccl import (
+                    PyNcclCommunicator,
+                )
+                from sglang.srt.distributed.utils import StatelessProcessGroup
+
+                stateless_group = StatelessProcessGroup.create(
+                    host=master_address,
+                    port=master_port,
+                    rank=rank,
+                    world_size=world_size,
+                )
+                comm = PyNcclCommunicator(
+                    group=stateless_group,
+                    device=self.device,
+                )
+                if comm.disabled:
+                    raise RuntimeError(
+                        "PyNcclCommunicator is disabled (libnccl not loadable). "
+                        "Set SGLANG_NCCL_SO_PATH to a valid libnccl.so."
+                    )
+                self._model_update_group[group_name] = comm
+                return True, "Succeeded to initialize custom process group (pynccl)."
+
+            assert (
+                torch.distributed.is_initialized()
+            ), "Default torch process group must be initialized"
             na = NetworkAddress(master_address, master_port)
             self._model_update_group[group_name] = init_custom_process_group(
                 backend=backend,
@@ -1651,7 +1692,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         try:
             if group_name in self._model_update_group:
                 pg = self._model_update_group.pop(group_name)
-                torch.distributed.destroy_process_group(pg)
+                from sglang.srt.distributed.device_communicators.pynccl import (
+                    PyNcclCommunicator,
+                )
+
+                if isinstance(pg, PyNcclCommunicator):
+                    # PyNcclCommunicator owns its NCCL communicator; release
+                    # by dropping the reference and letting __del__ run. No
+                    # torch.distributed.destroy_process_group call.
+                    del pg
+                else:
+                    torch.distributed.destroy_process_group(pg)
                 return True, "Succeeded to destroy custom process group."
             else:
                 return False, "The group to be destroyed does not exist."
@@ -1688,6 +1739,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 names, dtypes, shapes, group_name
             )
         try:
+            from sglang.srt.distributed.device_communicators.pynccl import (
+                PyNcclCommunicator,
+            )
+
+            group = self._model_update_group[group_name]
+            is_pynccl = isinstance(group, PyNcclCommunicator)
+
             weights = []
             handles = []
             for name, dtype, shape in zip(names, dtypes, shapes):
@@ -1695,14 +1753,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
                 )
                 weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-                handles.append(
-                    torch.distributed.broadcast(
-                        weight,
-                        src=0,
-                        group=self._model_update_group[group_name],
-                        async_op=True,
+                if is_pynccl:
+                    # PyNcclCommunicator.broadcast is sync (no async_op).
+                    # Receivers and sender both call broadcast(tensor, src=0).
+                    group.broadcast(weight, src=0)
+                else:
+                    handles.append(
+                        torch.distributed.broadcast(
+                            weight,
+                            src=0,
+                            group=group,
+                            async_op=True,
+                        )
                     )
-                )
                 weights.append((name, weight))
             for handle in handles:
                 handle.wait()
