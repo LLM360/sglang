@@ -8,7 +8,11 @@ from sglang.srt.models.xllm import (
     EntryClass,
     XllmAttention,
     XllmForCausalLM,
+    XllmGroupRMSNorm,
+    XllmMoEGate,
     XllmSparseMoeBlock,
+    permute_to_hf,
+    permute_to_xllm,
 )
 
 
@@ -47,6 +51,59 @@ class _IdentityRotary:
 
 
 class TestXllmModel(unittest.TestCase):
+    def test_permute_helpers_are_inverse(self):
+        x = torch.arange(2 * 3 * 8, dtype=torch.float32).reshape(2, 3, 8)
+
+        torch.testing.assert_close(permute_to_hf(permute_to_xllm(x)), x)
+        torch.testing.assert_close(permute_to_xllm(permute_to_hf(x)), x)
+
+    def test_group_rms_norm_matches_groupwise_formula_and_residual_contract(self):
+        norm = XllmGroupRMSNorm(hidden_size=4, n_groups=2, eps=0.0)
+        with torch.no_grad():
+            norm.weight.copy_(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+
+        x = torch.tensor([[3.0, 4.0, 0.0, 5.0]])
+        grouped = x.reshape(1, 2, 2)
+        expected = grouped * torch.rsqrt(grouped.pow(2).mean(-1, keepdim=True))
+        expected = expected.reshape(1, 4) * norm.weight
+
+        torch.testing.assert_close(norm(x), expected)
+
+        residual = torch.ones_like(x)
+        out, returned_residual = norm(x, residual=residual)
+        x_plus_residual = x + residual
+        grouped = x_plus_residual.reshape(1, 2, 2)
+        expected = grouped * torch.rsqrt(grouped.pow(2).mean(-1, keepdim=True))
+        expected = expected.reshape(1, 4) * norm.weight
+
+        torch.testing.assert_close(out, expected)
+        torch.testing.assert_close(returned_residual, x_plus_residual)
+
+    def test_moe_gate_bias_is_correction_bias_not_linear_bias(self):
+        config = SimpleNamespace(
+            hidden_size=3,
+            num_experts=2,
+            moe_gate_bias=True,
+        )
+        gate = XllmMoEGate(config)
+        with torch.no_grad():
+            gate.weight.copy_(
+                torch.tensor(
+                    [
+                        [1.0, 2.0, 3.0],
+                        [-1.0, 0.5, 2.0],
+                    ]
+                )
+            )
+            gate.bias.copy_(torch.tensor([10.0, -10.0]))
+
+        hidden_states = torch.tensor([[2.0, -1.0, 0.5]])
+        logits = gate(hidden_states)
+
+        torch.testing.assert_close(logits, hidden_states @ gate.weight.T)
+        self.assertEqual(gate.bias.dtype, torch.float32)
+        self.assertFalse(torch.allclose(logits, hidden_states @ gate.weight.T + gate.bias))
+
     def test_entry_class_and_expert_location_metadata(self):
         self.assertIs(EntryClass, XllmForCausalLM)
 
@@ -114,6 +171,25 @@ class TestXllmModel(unittest.TestCase):
         self.assertEqual(block.topk.hidden_shape, (1, 4))
         self.assertEqual(block.topk.router_shape, (1, 4))
         torch.testing.assert_close(out, torch.ones_like(hidden_states))
+        torch.testing.assert_close(
+            block.experts.seen_topk_output.topk_weights,
+            block.topk.output.topk_weights * block.router_scaling_factor,
+        )
+
+    def test_router_expert_path_uses_native_topk_and_scales_weights(self):
+        block = object.__new__(XllmSparseMoeBlock)
+        torch.nn.Module.__init__(block)
+        block.router_scaling_factor = 4.0
+        block.topk = _RecordingTopK()
+        block.experts = _RecordingExperts()
+        block.gate = lambda hidden_states: torch.randn(hidden_states.shape[0], 4)
+
+        hidden_states = torch.randn(1, 4)
+        out = XllmSparseMoeBlock._forward_router_experts(block, hidden_states)
+
+        torch.testing.assert_close(out, torch.zeros_like(hidden_states))
+        self.assertEqual(block.topk.native_calls, 1)
+        self.assertEqual(block.topk.generic_calls, 0)
         torch.testing.assert_close(
             block.experts.seen_topk_output.topk_weights,
             block.topk.output.topk_weights * block.router_scaling_factor,
