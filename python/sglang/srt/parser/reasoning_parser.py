@@ -477,6 +477,51 @@ class MistralDetector(BaseReasoningFormatDetector):
         )
 
 
+class K2V3Detector(BaseReasoningFormatDetector):
+    """
+    Detector for the K2-v3 model family.
+
+    K2-v3 supports three reasoning effort levels, each using a different
+    think token pair selected via ``reasoning_effort`` in
+    ``chat_template_kwargs``:
+      - high (default): <think> / </think>
+      - medium:         <think_fast> / </think_fast>
+      - low:            <think_faster> / </think_faster>
+
+    The chat template inserts the start token into the prompt, so the
+    generated output typically contains only the end token.
+    """
+
+    _EFFORT_TOKENS: dict = {
+        "high": ("<think>", "</think>"),
+        "medium": ("<think_fast>", "</think_fast>"),
+        "low": ("<think_faster>", "</think_faster>"),
+    }
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        reasoning_effort: str = "high",
+    ):
+        effort = reasoning_effort or "high"
+        if effort == "none":
+            effort = "high"
+        start_token, end_token = self._EFFORT_TOKENS.get(
+            effort, self._EFFORT_TOKENS["high"]
+        )
+        super().__init__(
+            start_token,
+            end_token,
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -505,6 +550,7 @@ class ReasoningParser:
         "mistral": MistralDetector,
         "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
+        "k2_v3": K2V3Detector,
     }
 
     def __init__(
@@ -542,6 +588,13 @@ class ReasoningParser:
         chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True
+
+        # K2-v3 selects its token pair via reasoning_effort. Forward the
+        # value only to detectors that accept it (currently K2V3Detector).
+        if model_type.lower() == "k2_v3":
+            effort = chat_template_kwargs.get("reasoning_effort")
+            if effort:
+                kwargs["reasoning_effort"] = effort
 
         self.detector = detector_class(**kwargs)
 
