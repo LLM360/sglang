@@ -589,10 +589,15 @@ class ReasoningParser:
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True
 
-        # K2-v3 selects its token pair via reasoning_effort. Forward the
-        # value only to detectors that accept it (currently K2V3Detector).
+        # K2-v3 selects its token pair via reasoning_effort. The OpenAI server
+        # pops reasoning_effort out of chat_template_kwargs and promotes it to
+        # request.reasoning_effort (see serving_chat.py); fall back to the
+        # kwargs dict for callers that bypass that normalization.
         if model_type.lower() == "k2_v3":
-            effort = chat_template_kwargs.get("reasoning_effort")
+            effort = (
+                getattr(request, "reasoning_effort", None)
+                or chat_template_kwargs.get("reasoning_effort")
+            )
             if effort:
                 kwargs["reasoning_effort"] = effort
 

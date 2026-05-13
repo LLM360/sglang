@@ -97,6 +97,21 @@ class TestK2V3ParserIntegration(CustomTestCase):
         parser = ReasoningParser(model_type="k2_v3", request=req)
         self.assertEqual(parser.detector.think_start_token, "<think_faster>")
 
+    def test_parser_reads_top_level_reasoning_effort(self):
+        """serving_chat.py pops reasoning_effort out of chat_template_kwargs
+        and moves it to request.reasoning_effort before reaching the parser.
+        The parser must read from the top-level field, not just the kwargs."""
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+        req = ChatCompletionRequest(
+            model="k2-v3",
+            messages=[{"role": "user", "content": "hi"}],
+            reasoning_effort="medium",
+        )
+        parser = ReasoningParser(model_type="k2_v3", request=req)
+        self.assertEqual(parser.detector.think_start_token, "<think_fast>")
+        self.assertEqual(parser.detector.think_end_token, "</think_fast>")
+
     def test_parser_ignores_reasoning_effort_for_non_k2v3(self):
         """reasoning_effort kwarg must NOT be forwarded to Qwen3Detector.
 
