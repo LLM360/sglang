@@ -489,7 +489,8 @@ class K2V3Detector(BaseReasoningFormatDetector):
       - low:            <think_faster> / </think_faster>
 
     The chat template inserts the start token into the prompt, so the
-    generated output typically contains only the end token.
+    generated output typically contains only the end token. Parsing therefore
+    requires forced reasoning mode.
     """
 
     _EFFORT_TOKENS: dict = {
@@ -501,11 +502,14 @@ class K2V3Detector(BaseReasoningFormatDetector):
     def __init__(
         self,
         stream_reasoning: bool = True,
-        force_reasoning: bool = False,
+        force_reasoning: bool = True,
         continue_final_message: bool = False,
         previous_content: str = "",
         reasoning_effort: str = "high",
     ):
+        if not force_reasoning:
+            raise ValueError("K2-v3 reasoning parser requires force_reasoning=True")
+
         effort = reasoning_effort or "high"
         if effort == "none":
             effort = "high"

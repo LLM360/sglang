@@ -39,9 +39,20 @@ class TestK2V3DetectorTokenSelection(CustomTestCase):
         detector = K2V3Detector()
         self.assertEqual(detector.think_start_token, "<think>")
 
+    def test_force_reasoning_false_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "requires force_reasoning=True"):
+            K2V3Detector(force_reasoning=False)
+
 
 class TestK2V3DetectorParsing(CustomTestCase):
     """K2-v3 inherits the standard <think>...</think> state machine."""
+
+    def test_medium_effort_parses_end_only_output(self):
+        detector = K2V3Detector(reasoning_effort="medium")
+        text = "reasoning here</think_fast>final answer"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning here")
+        self.assertEqual(result.normal_text, "final answer")
 
     def test_medium_effort_parses_think_fast_block(self):
         detector = K2V3Detector(reasoning_effort="medium")
@@ -72,6 +83,14 @@ class TestK2V3ParserIntegration(CustomTestCase):
     def test_parser_routes_to_k2v3_detector(self):
         parser = ReasoningParser(model_type="k2_v3")
         self.assertIsInstance(parser.detector, K2V3Detector)
+        self.assertEqual(parser.detector.think_start_token, "<think>")
+
+    def test_parser_rejects_force_reasoning_false(self):
+        with self.assertRaisesRegex(ValueError, "requires force_reasoning=True"):
+            ReasoningParser(model_type="k2_v3", force_reasoning=False)
+
+    def test_parser_allows_force_reasoning_false_for_non_k2v3(self):
+        parser = ReasoningParser(model_type="qwen3", force_reasoning=False)
         self.assertEqual(parser.detector.think_start_token, "<think>")
 
     def test_parser_forwards_reasoning_effort_medium(self):
