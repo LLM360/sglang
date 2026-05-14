@@ -87,6 +87,73 @@ class TestMinimaxDialect(unittest.TestCase):
         self.assertEqual(result.normal_text, "plain text")
 
 
+class TestQwen3Dialect(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            _make_tool(
+                "get_weather",
+                {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "days": {"type": "integer"},
+                    },
+                },
+            ),
+            _make_tool(
+                "get_time",
+                {
+                    "type": "object",
+                    "properties": {
+                        "timezone": {"type": "string"},
+                    },
+                },
+            ),
+        ]
+        self.det = MultiFormatDetector(tool_format="qwen3")
+
+    def test_bare_function_without_tool_call_wrapper(self):
+        text = (
+            "<function=get_weather>\n"
+            "<parameter=city>SF</parameter>\n"
+            "<parameter=days>3</parameter>\n"
+            "</function>"
+        )
+
+        self.assertTrue(self.det.has_tool_call(text))
+        result = self.det.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters),
+            {"city": "SF", "days": 3},
+        )
+
+    def test_preserves_text_between_multiple_tool_blocks(self):
+        text = (
+            "pre"
+            "<tool_call><function=get_weather>"
+            "<parameter=city>SF</parameter>"
+            "</function></tool_call>"
+            "middle"
+            "<tool_call><function=get_time>"
+            "<parameter=timezone>UTC</parameter>"
+            "</function></tool_call>"
+            "post"
+        )
+
+        result = self.det.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "premiddle")
+        self.assertEqual(
+            [call.name for call in result.calls], ["get_weather", "get_time"]
+        )
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+        self.assertEqual(json.loads(result.calls[1].parameters), {"timezone": "UTC"})
+
+
 class TestDsv32Dialect(unittest.TestCase):
     def setUp(self):
         self.tools = [_make_tool("get_weather")]
