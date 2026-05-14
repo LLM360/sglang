@@ -188,15 +188,17 @@ class TestDsv32Dialect(unittest.TestCase):
         result = self.det.detect_and_parse(text, self.tools)
         self.assertEqual(json.loads(result.calls[0].parameters), {"x": 42})
 
-    def test_unknown_tool_is_skipped(self):
-        """Tool names not in tools list are logged and skipped, not raised."""
+    def test_unknown_tool_is_forwarded(self):
         text = (
             '<tool_calls><invoke name="not_a_registered_tool">'
             '<parameter name="x">NYC</parameter>'
             '</invoke></tool_calls>'
         )
         result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(result.calls, [])
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].tool_index, -1)
+        self.assertEqual(result.calls[0].name, "not_a_registered_tool")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"x": "NYC"})
 
 
 class TestDsv32VsDeepSeekV32Disjoint(unittest.TestCase):
@@ -311,17 +313,17 @@ class TestGptOssDialect(unittest.TestCase):
         result = self.det.detect_and_parse(text, self.tools)
         self.assertEqual(result.calls, [])
 
-    def test_unknown_tool_returns_full_text(self):
-        """Parity with other extractors: when every matched tool is unknown,
-        return the full text (not a truncated prefix that loses the tool-call block)."""
+    def test_unknown_tool_is_forwarded(self):
         text = (
             '<tool_call>assistant to=functions.unregistered_fn json\n'
             '{"x": 1}\n'
             "</tool_call>"
         )
         result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(result.calls, [])
-        self.assertEqual(result.normal_text, text)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].tool_index, -1)
+        self.assertEqual(result.calls[0].name, "unregistered_fn")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"x": 1})
 
 
 class TestPythonDialect(unittest.TestCase):
@@ -358,6 +360,46 @@ class TestPythonDialect(unittest.TestCase):
         text = '<tool_call>get_weather(x=2+2)</tool_call>'
         result = self.det.detect_and_parse(text, self.tools)
         self.assertEqual(result.calls, [])
+
+
+class TestUnknownToolForwarding(unittest.TestCase):
+    def setUp(self):
+        self.tools = [_make_tool("get_weather")]
+
+    def test_embedded_dialects_forward_unknown_tool_names(self):
+        cases = {
+            "minimax": (
+                '<tool_calls><invoke name="not_registered">'
+                '<parameter name="x">NYC</parameter>'
+                "</invoke></tool_calls>"
+            ),
+            "dsv32": (
+                '<tool_calls><invoke name="not_registered">'
+                '<parameter name="x" string="true">NYC</parameter>'
+                "</invoke></tool_calls>"
+            ),
+            "glm": (
+                "<tool_call>not_registered"
+                "<arg_key>x</arg_key><arg_value>NYC</arg_value>"
+                "</tool_call>"
+            ),
+            "gptoss": (
+                '<tool_call>assistant to=functions.not_registered json\n'
+                '{"x": "NYC"}\n'
+                "</tool_call>"
+            ),
+            "python": '<tool_call>not_registered(x="NYC")</tool_call>',
+        }
+
+        for dialect, text in cases.items():
+            with self.subTest(dialect=dialect):
+                result = MultiFormatDetector(tool_format=dialect).detect_and_parse(
+                    text, self.tools
+                )
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(result.calls[0].tool_index, -1)
+                self.assertEqual(result.calls[0].name, "not_registered")
+                self.assertEqual(json.loads(result.calls[0].parameters), {"x": "NYC"})
 
 
 class TestFunctionCallParserPlumbing(unittest.TestCase):

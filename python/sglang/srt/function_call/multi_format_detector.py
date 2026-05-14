@@ -157,12 +157,9 @@ class MultiFormatDetector(BaseFormatDetector):
                         args[pname] = pvalue
                     else:
                         args[pname] = self._json_or_string(pvalue)
-                if func_name not in tool_indices:
-                    logger.warning("Unknown tool name %s; skipping", func_name)
-                    continue
                 calls.append(
                     ToolCallItem(
-                        tool_index=tool_indices[func_name],
+                        tool_index=tool_indices.get(func_name, -1),
                         name=func_name,
                         parameters=json.dumps(args, ensure_ascii=False),
                     )
@@ -198,11 +195,11 @@ class MultiFormatDetector(BaseFormatDetector):
                         args[key] = raw
                     else:
                         args[key] = self._deserialize_glm_value(raw)
-            if not func_name or func_name not in tool_indices:
+            if not func_name:
                 continue
             calls.append(
                 ToolCallItem(
-                    tool_index=tool_indices[func_name],
+                    tool_index=tool_indices.get(func_name, -1),
                     name=func_name,
                     parameters=json.dumps(args, ensure_ascii=False),
                 )
@@ -225,11 +222,9 @@ class MultiFormatDetector(BaseFormatDetector):
         for m in matches:
             func_name = m.group(1)
             args = json.loads(m.group(2).strip())
-            if func_name not in tool_indices:
-                continue
             calls.append(
                 ToolCallItem(
-                    tool_index=tool_indices[func_name],
+                    tool_index=tool_indices.get(func_name, -1),
                     name=func_name,
                     parameters=json.dumps(args, ensure_ascii=False),
                 )
@@ -265,11 +260,9 @@ class MultiFormatDetector(BaseFormatDetector):
                 args: dict[str, Any] = {}
                 for kw in call.keywords:
                     args[kw.arg] = self._python_literal(kw.value)
-                if func_name not in tool_indices:
-                    continue
                 calls.append(
                     ToolCallItem(
-                        tool_index=tool_indices[func_name],
+                        tool_index=tool_indices.get(func_name, -1),
                         name=func_name,
                         parameters=json.dumps(args, ensure_ascii=False),
                     )
