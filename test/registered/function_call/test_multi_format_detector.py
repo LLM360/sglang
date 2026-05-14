@@ -36,9 +36,9 @@ class TestMultiFormatDispatch(unittest.TestCase):
         det = MultiFormatDetector()
         self.assertIsInstance(det._delegate, HermesDetector)
 
-    def test_unknown_dialect_falls_back_to_default(self):
-        det = MultiFormatDetector(tool_format="not-a-dialect")
-        self.assertIsInstance(det._delegate, HermesDetector)
+    def test_unknown_dialect_errors(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported tool_format"):
+            MultiFormatDetector(tool_format="not-a-dialect")
 
     def test_embedded_dialects_set_delegate_to_none(self):
         for dialect in ("minimax", "dsv32", "glm", "gptoss", "python"):

@@ -35,6 +35,8 @@ from sglang.srt.function_call.core_types import (
 logger = logging.getLogger(__name__)
 
 _EMBEDDED_DIALECTS = {"minimax", "dsv32", "glm", "gptoss", "python"}
+_DELEGATING_DIALECTS = {"default", "qwen3"}
+_SUPPORTED_DIALECTS = _EMBEDDED_DIALECTS | _DELEGATING_DIALECTS
 
 
 class MultiFormatDetector(BaseFormatDetector):
@@ -52,9 +54,14 @@ class MultiFormatDetector(BaseFormatDetector):
 
         self._delegate: Optional[BaseFormatDetector] = None
 
-        if self.tool_format == "default" or self.tool_format not in (
-            _EMBEDDED_DIALECTS | {"qwen3"}
-        ):
+        if self.tool_format not in _SUPPORTED_DIALECTS:
+            raise ValueError(
+                f"Unsupported tool_format for multi_format parser: "
+                f"{self.tool_format!r}. Supported formats: "
+                f"{', '.join(sorted(_SUPPORTED_DIALECTS))}."
+            )
+
+        if self.tool_format == "default":
             from sglang.srt.function_call.hermes_detector import HermesDetector
 
             self._delegate = HermesDetector()
