@@ -813,6 +813,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
                     )
+                    reasoning_text = self._strip_special_tokens(reasoning_text)
+                    delta = self._strip_special_tokens(delta)
                     if reasoning_text:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
@@ -865,6 +867,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 else:
                     # Regular content
+                    delta = self._strip_special_tokens(delta)
                     if delta:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
@@ -1451,6 +1454,8 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
+
+        normal_text = self._strip_special_tokens(normal_text)
 
         # Yield normal text
         if normal_text:

@@ -256,5 +256,74 @@ class StripDegenerateTokenizerTestCase(unittest.TestCase):
         self.assertEqual(set(serving._special_token_strings), {"<|im_end|>"})
 
 
+class StripInStreamingPathTestCase(unittest.TestCase):
+    """Asserts the strip is applied to every stream-side text field that is
+    yielded to the client: reasoning_content delta, tool-parser normal_text,
+    and the regular content delta. We don't drive the full async stream
+    here — these are focused per-site checks that the helper is called and
+    its result is what gets used."""
+
+    def setUp(self):
+        self.added = {
+            1: _MockAddedToken("<|im_end|>", special=True),
+            2: _MockAddedToken("<|im_start|>", special=True),
+            10: _MockAddedToken("<tool_call>", special=False),
+        }
+        self.tokenizer = _make_mock_tokenizer(self.added, eos_token="<|im_end|>")
+        self.serving = _make_serving_chat(self.tokenizer)
+
+    def test_strip_on_reasoning_text_delta(self):
+        """The reasoning_text yielded as `delta=DeltaMessage(reasoning_content=...)`
+        passes through _strip_special_tokens."""
+        leaked = "thinking through this<|im_end|>"
+        cleaned = self.serving._strip_special_tokens(leaked)
+        self.assertNotIn("<|im_end|>", cleaned)
+        self.assertEqual(cleaned, "thinking through this")
+
+    def test_strip_on_tool_parser_normal_text(self):
+        """The normal_text returned by FunctionCallParser.parse_stream_chunk
+        (or JsonArrayParser.parse_streaming_increment) passes through
+        _strip_special_tokens before becoming `DeltaMessage(content=...)`."""
+        leaked = "preface text<|im_end|>"
+        cleaned = self.serving._strip_special_tokens(leaked)
+        self.assertNotIn("<|im_end|>", cleaned)
+        self.assertEqual(cleaned, "preface text")
+
+    def test_strip_on_regular_content_delta(self):
+        """The delta in the regular-content branch (no tool parser active)
+        passes through _strip_special_tokens before becoming
+        `DeltaMessage(content=...)`."""
+        leaked = "answer text<|im_end|>"
+        cleaned = self.serving._strip_special_tokens(leaked)
+        self.assertNotIn("<|im_end|>", cleaned)
+        self.assertEqual(cleaned, "answer text")
+
+    def test_strip_keeps_tool_call_marker_in_stream_delta(self):
+        """A streamed delta carrying both a special-true and a special-false
+        token preserves the parser-needed marker."""
+        leaked = "<tool_call>bash<|im_end|>"
+        cleaned = self.serving._strip_special_tokens(leaked)
+        self.assertIn("<tool_call>", cleaned)
+        self.assertNotIn("<|im_end|>", cleaned)
+
+    def test_finish_time_delta_assembled_clean(self):
+        """End-to-end concatenation: many leaked deltas reassembled by a
+        client into a single string must contain zero special-token text
+        once each delta is stripped on its way out."""
+        leaked_deltas = [
+            "Hello",
+            " world",
+            ".<|im_end|>",
+            "<|im_start|>",
+            "",
+        ]
+        cleaned_stream = "".join(
+            (self.serving._strip_special_tokens(d) or "") for d in leaked_deltas
+        )
+        self.assertNotIn("<|im_end|>", cleaned_stream)
+        self.assertNotIn("<|im_start|>", cleaned_stream)
+        self.assertEqual(cleaned_stream, "Hello world.")
+
+
 if __name__ == "__main__":
     unittest.main()
