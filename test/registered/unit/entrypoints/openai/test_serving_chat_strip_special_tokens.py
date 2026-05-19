@@ -17,7 +17,7 @@ import importlib.machinery
 import sys
 import types
 import unittest
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 
 # ----------------------------------------------------------------------------
@@ -124,9 +124,12 @@ def _make_serving_chat(tokenizer):
     exercising the strip helpers without touching the network/engine."""
     tm = _make_mock_tokenizer_manager(tokenizer)
     tpl = _make_mock_template_manager()
-    # _use_dpsk_v32_encoding probes attributes we haven't mocked; bypass it.
-    OpenAIServingChat._use_dpsk_v32_encoding = lambda self: False  # type: ignore[assignment]
-    return OpenAIServingChat(tm, tpl)
+    # _use_dpsk_v32_encoding probes unmocked attrs; scope the bypass to
+    # the constructor only.
+    with patch.object(
+        OpenAIServingChat, "_use_dpsk_v32_encoding", return_value=False
+    ):
+        return OpenAIServingChat(tm, tpl)
 
 
 # ----------------------------------------------------------------------------
