@@ -5,6 +5,10 @@ import unittest
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+
 
 class TestReqAnswerStartPosition(unittest.TestCase):
     def test_set_when_think_end_detected(self):

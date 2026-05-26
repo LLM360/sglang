@@ -9,6 +9,10 @@ import torch
 
 from sglang.srt.managers.schedule_batch import collect_cached_positions
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+
 
 class TestCollectCachedPositions(unittest.TestCase):
     def test_returns_none_when_no_req_has_cached_positions(self):

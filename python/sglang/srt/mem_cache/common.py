@@ -115,6 +115,7 @@ def split_kv_for_no_cache_thoughts(
     output_ids: List[int],
     req_to_token_slot: torch.Tensor,
     answer_start_position: int,
+    think_start_id: Optional[int] = None,
 ) -> NoCacheThoughtsSplit:
     """Compute the split-insertion tensors for a finished reasoning request.
 
@@ -130,6 +131,14 @@ def split_kv_for_no_cache_thoughts(
             sequence (length must be >= len(origin_input_ids) + len(output_ids)).
         answer_start_position: absolute position (in the input+output index space)
             of the first answer token, i.e. the token immediately after `</think>`.
+        think_start_id: when provided, the trailing run of `origin_input_ids` from
+            the last occurrence of this token id onward is treated as the chat
+            template's <think>... priming tail. Those tokens live only in this
+            turn's input (added by add_generation_prompt before decode began);
+            future turns' chat-template rendering of the historical assistant
+            message does NOT include them. They are excluded from the virtual
+            cached prompt and added to the freed slice, so the cached entry
+            aligns with what subsequent turns' inputs will actually contain.
 
     Returns:
         NoCacheThoughtsSplit with:
@@ -149,16 +158,36 @@ def split_kv_for_no_cache_thoughts(
     # Clamp answer_start so we behave sanely if reasoning never finished.
     answer_start = min(answer_start_position, total_len)
 
-    # Slots / positions for input + post-</think> answer.
+    # Identify the chat-template priming tail at the end of origin_input_ids
+    # (typically a `<think>\n` block added by add_generation_prompt). Excluded
+    # from the cached prompt so the cached entry aligns with the way future
+    # turns render the prior assistant turn (without the priming tokens).
+    prompt_keep_len = input_len
+    if think_start_id is not None:
+        for i in range(input_len - 1, -1, -1):
+            if origin_input_ids[i] == think_start_id:
+                prompt_keep_len = i
+                break
+
+    # Slots / positions for input prompt (sans priming) + post-</think> answer.
     answer_count = max(total_len - answer_start, 0)
     answer_output_offset = answer_start - input_len  # index into output_ids
 
-    virtual_token_ids = list(origin_input_ids) + list(
+    virtual_token_ids = list(origin_input_ids[:prompt_keep_len]) + list(
         output_ids[answer_output_offset:] if answer_count > 0 else []
     )
 
-    kept_slot_indices = list(range(input_len)) + list(range(answer_start, total_len))
-    kept_positions = list(range(input_len)) + list(range(answer_start, total_len))
+    kept_slot_indices = list(range(prompt_keep_len)) + list(
+        range(answer_start, total_len)
+    )
+    kept_positions = list(range(prompt_keep_len)) + list(
+        range(answer_start, total_len)
+    )
+    # Only the actual decoded thoughts (between the input prompt and </think>)
+    # are freed here. The priming tail (between prompt_keep_len and input_len)
+    # is still owned by the radix entry that cache_unfinished_req inserted at
+    # prefill time — freeing it produces a double-count against the allocator
+    # ("memory leak detected") because the tree node still claims those slots.
     thought_slot_indices = list(range(input_len, answer_start))
 
     device = req_to_token_slot.device
@@ -651,12 +680,17 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     ):
         # Skip the thought tokens from the shared prefix cache; insert only the
         # input + post-</think> answer slice, preserving original RoPE positions.
+        # think_start_id (when populated by the scheduler) lets the split helper
+        # also strip the chat-template's <think>\n priming tail from origin_input_ids
+        # so the cached prompt aligns with how future turns render this assistant
+        # message (without the priming).
         req_to_token_slot = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx]
         split = split_kv_for_no_cache_thoughts(
             origin_input_ids=req.origin_input_ids,
             output_ids=req.output_ids,
             req_to_token_slot=req_to_token_slot,
             answer_start_position=req.answer_start_position,
+            think_start_id=getattr(req, "_think_start_id", None),
         )
         tree_cache.cache_finished_req(req, is_insert=is_insert, split=split)
     else:

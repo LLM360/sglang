@@ -6,6 +6,10 @@ routing in release_kv_cache doesn't raise TypeError on these backends.
 import inspect
 import unittest
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+
 
 def _accepts_split(cls) -> bool:
     sig = inspect.signature(cls.cache_finished_req)

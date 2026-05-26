@@ -12,6 +12,10 @@ import torch
 
 from sglang.srt.mem_cache.common import derive_extend_position_start
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+
 
 class TestDeriveExtendPositionStart(unittest.TestCase):
     def test_returns_none_when_all_requests_lack_cached_positions(self):

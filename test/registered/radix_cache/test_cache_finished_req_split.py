@@ -15,6 +15,10 @@ from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.common import split_kv_for_no_cache_thoughts
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+
 
 class TestCacheFinishedReqSplit(unittest.TestCase):
     def test_split_inserts_virtual_slice_with_positions(self):

@@ -8,6 +8,10 @@ import torch
 
 from sglang.srt.mem_cache.common import derive_position_offsets
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+
 
 class TestDerivePositionOffsets(unittest.TestCase):
     def test_returns_none_when_no_cached_positions(self):

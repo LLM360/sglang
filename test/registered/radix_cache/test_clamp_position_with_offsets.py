@@ -13,6 +13,10 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import _clamp_position_native
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+
 
 class TestClampPositionWithOffsets(unittest.TestCase):
     def test_offset_shifts_position(self):

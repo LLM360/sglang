@@ -28,7 +28,7 @@ branch's SGLang. Example invocation from the m2 login node:
     srun --partition=main --time=00:30:00 -N 1 --gres=gpu:2 \
         --container-image=/mnt/weka/shrd/k2pta/agentic_rl_images/agentic-rl-2eff86d1.sqsh \
         --container-mounts=/mnt/weka:/mnt/weka,$PWD:/sglang \
-        bash -c "pip install --no-deps --force-reinstall /sglang/python && \
+        bash -c "pip install --no-deps -e /sglang/python && \
                  cd /sglang && python3 -m unittest test.manual.test_no_cache_thoughts_e2e -v"
 
 Two GPUs are requested so the two servers can run side-by-side (each on its
@@ -46,6 +46,15 @@ import unittest
 import requests
 
 BBQ_PATH = "/mnt/weka/shrd/k2m/suqi.sun/bbq_image/bbq-8b-mid3-final"
+# Upstream BBQ chat template from LLM360/bbq-chat-template:main, which drops the
+# empty <think></think> block in assistant rendering when message.think is not
+# explicitly set. Required for --no-cache-thoughts to align with multi-turn
+# input on turn 2. Mid3's bundled chat_template.jinja is stale.
+CHAT_TEMPLATE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "chat_templates",
+    "bbq_upstream.jinja",
+)
 PORT_NO_CACHE = 30000
 PORT_BASELINE = 30001
 BASE_URL_NO_CACHE = f"http://127.0.0.1:{PORT_NO_CACHE}"
@@ -65,6 +74,8 @@ def _launch(port: int, extra_args: list[str], gpu: str) -> subprocess.Popen:
         BBQ_PATH,
         "--reasoning-parser",
         "k2_v3",
+        "--chat-template",
+        CHAT_TEMPLATE,
         "--enable-cache-report",
         "--trust-remote-code",
         "--host",
@@ -74,7 +85,15 @@ def _launch(port: int, extra_args: list[str], gpu: str) -> subprocess.Popen:
         "--mem-fraction-static",
         "0.80",
     ] + list(extra_args)
-    return subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # Write server logs alongside the test source (bind-mounted) so the file
+    # survives the container shutdown and can be inspected from the host.
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".e2e_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"sglang_port{port}.log")
+    log_fd = open(log_path, "w")
+    proc = subprocess.Popen(cmd, env=env, stdout=log_fd, stderr=subprocess.STDOUT)
+    proc._log_path = log_path  # type: ignore[attr-defined]
+    return proc
 
 
 def _wait_healthy(base_url: str, proc: subprocess.Popen) -> None:
@@ -87,11 +106,14 @@ def _wait_healthy(base_url: str, proc: subprocess.Popen) -> None:
         except Exception:
             pass
         if proc.poll() is not None:
-            tail = (
-                proc.stdout.read().decode("utf-8", "replace")[-4000:]
-                if proc.stdout
-                else ""
-            )
+            log_path = getattr(proc, "_log_path", None)
+            tail = ""
+            if log_path:
+                try:
+                    with open(log_path) as f:
+                        tail = f.read()[-4000:]
+                except Exception:
+                    pass
             raise RuntimeError(f"server at {base_url} exited early:\n{tail}")
         time.sleep(3)
     raise TimeoutError(f"server at {base_url} never became healthy")
@@ -144,14 +166,38 @@ class TestNoCacheThoughtsE2E(unittest.TestCase):
         _kill(cls.proc_no_cache)
         _kill(cls.proc_baseline)
 
+    def _dump_logs_on_failure(self, label: str, proc: subprocess.Popen) -> None:
+        """Always dump the server log on any chat failure — works whether the
+        server is dead or just unreachable."""
+        log_path = getattr(proc, "_log_path", None)
+        if log_path is None:
+            return
+        try:
+            with open(log_path) as f:
+                out = f.read()
+            print(
+                f"=== {label} server log (last 6KB) from {log_path} ===\n{out[-6000:]}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"(failed to read {label} log: {e})", flush=True)
+
     def test_cached_tokens_delta_on_turn2(self):
         user_turn1 = {
             "role": "user",
             "content": "What is 12 * 7? Reason carefully.",
         }
         # Turn 1 on both servers.
-        resp_nc = _chat(BASE_URL_NO_CACHE, [user_turn1], max_tokens=512)
-        resp_bl = _chat(BASE_URL_BASELINE, [user_turn1], max_tokens=512)
+        try:
+            resp_nc = _chat(BASE_URL_NO_CACHE, [user_turn1], max_tokens=512)
+        except Exception:
+            self._dump_logs_on_failure("no_cache (turn 1)", self.proc_no_cache)
+            raise
+        try:
+            resp_bl = _chat(BASE_URL_BASELINE, [user_turn1], max_tokens=512)
+        except Exception:
+            self._dump_logs_on_failure("baseline (turn 1)", self.proc_baseline)
+            raise
 
         ans_nc = resp_nc["choices"][0]["message"]["content"]
         ans_bl = resp_bl["choices"][0]["message"]["content"]
@@ -164,16 +210,24 @@ class TestNoCacheThoughtsE2E(unittest.TestCase):
             "content": "Now multiply that result by 3.",
         }
         # Turn 2 history: chat template strips <think> from prior assistant messages.
-        resp_nc_t2 = _chat(
-            BASE_URL_NO_CACHE,
-            [user_turn1, {"role": "assistant", "content": ans_nc}, user_turn2],
-            max_tokens=256,
-        )
-        resp_bl_t2 = _chat(
-            BASE_URL_BASELINE,
-            [user_turn1, {"role": "assistant", "content": ans_bl}, user_turn2],
-            max_tokens=256,
-        )
+        try:
+            resp_nc_t2 = _chat(
+                BASE_URL_NO_CACHE,
+                [user_turn1, {"role": "assistant", "content": ans_nc}, user_turn2],
+                max_tokens=256,
+            )
+        except Exception:
+            self._dump_logs_on_failure("no_cache (turn 2)", self.proc_no_cache)
+            raise
+        try:
+            resp_bl_t2 = _chat(
+                BASE_URL_BASELINE,
+                [user_turn1, {"role": "assistant", "content": ans_bl}, user_turn2],
+                max_tokens=256,
+            )
+        except Exception:
+            self._dump_logs_on_failure("baseline (turn 2)", self.proc_baseline)
+            raise
 
         cached_nc = resp_nc_t2["usage"]["prompt_tokens_details"]["cached_tokens"]
         cached_bl = resp_bl_t2["usage"]["prompt_tokens_details"]["cached_tokens"]

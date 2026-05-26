@@ -11,6 +11,10 @@ import torch
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.common import NoCacheThoughtsSplit
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+
 
 class TestChunkCacheSplitKwarg(unittest.TestCase):
     def test_cache_finished_req_accepts_split(self):

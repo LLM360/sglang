@@ -18,6 +18,10 @@ import torch
 from sglang.srt.mem_cache.common import split_kv_for_no_cache_thoughts
 from sglang.test.test_utils import CustomTestCase
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+
 
 class TestNoCacheThoughtsSplit(CustomTestCase):
     """Validate the split-insertion helper for --no-cache-thoughts."""
@@ -86,6 +90,58 @@ class TestNoCacheThoughtsSplit(CustomTestCase):
         # All output tokens are thoughts to free.
         self.assertEqual(
             result.thought_kv_indices_to_free.tolist(), [1002, 1003, 1004, 1005]
+        )
+
+    def test_priming_tail_excluded_from_cached_prompt(self):
+        """When think_start_id is provided and origin_input_ids ends with a
+        <think>\\n priming tail (i.e. add_generation_prompt added <think>\\n
+        before decode began), those priming tokens must NOT be part of the
+        virtual cached prompt. They live only in turn 1's input; future turns'
+        chat-template rendering of the historical assistant message doesn't
+        include them. Including them in the cached path causes a token
+        mismatch on turn 2 at the position right after the assistant header.
+
+        Setup mirrors a typical K2-v3 reasoning turn:
+          positions:    0   1   2   3       4    5   6   7         8   9
+          tokens:       A   B   C   <think> \\n   t1  t2  </think>  X   Y
+                        └─prompt──┘ └─priming─┘  └──thoughts────┘  └answer┘
+        think_start_id == 500 == the <think> token id
+        answer_start_position = 8
+
+        Expected:
+          virtual_token_ids = [A, B, C, X, Y]
+          virtual_kv_indices = slots [0, 1, 2, 8, 9]
+          virtual_positions = [0, 1, 2, 8, 9]
+          thought_kv_indices_to_free = slots [3, 4, 5, 6, 7]
+        """
+        origin_input_ids = [101, 102, 103, 500, 599]  # last 2 are priming <think>\\n
+        output_ids = [201, 202, 502, 301, 302]  # think tokens, </think>, answer
+        req_to_token_slot = torch.tensor(
+            [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009],
+            dtype=torch.int64,
+        )
+        answer_start_position = 8
+
+        result = split_kv_for_no_cache_thoughts(
+            origin_input_ids=origin_input_ids,
+            output_ids=output_ids,
+            req_to_token_slot=req_to_token_slot,
+            answer_start_position=answer_start_position,
+            think_start_id=500,
+        )
+
+        self.assertEqual(result.virtual_token_ids, [101, 102, 103, 301, 302])
+        self.assertEqual(
+            result.virtual_kv_indices.tolist(), [1000, 1001, 1002, 1008, 1009]
+        )
+        self.assertEqual(result.virtual_positions.tolist(), [0, 1, 2, 8, 9])
+        # Only the actual decoded thought slots (input_len..answer_start-1) get
+        # freed. The priming slots (prompt_keep_len..input_len-1) stay owned by
+        # the radix entry that cache_unfinished_req inserted during prefill;
+        # freeing them here would double-count and trigger leak detection.
+        self.assertEqual(
+            result.thought_kv_indices_to_free.tolist(),
+            [1005, 1006, 1007],
         )
 
     def test_split_long_answer(self):

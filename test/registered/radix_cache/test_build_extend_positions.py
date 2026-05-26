@@ -11,6 +11,10 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import build_extend_positions
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+
 
 class TestBuildExtendPositions(unittest.TestCase):
     def test_legacy_path_when_no_cached_positions(self):

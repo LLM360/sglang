@@ -5,6 +5,10 @@ import unittest
 
 from sglang.srt.server_args import ServerArgs
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+
 
 class TestNoCacheThoughtsCliFlag(unittest.TestCase):
     def test_default_is_false(self):
