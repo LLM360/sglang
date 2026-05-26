@@ -487,13 +487,67 @@ class RadixCache(BasePrefixCache):
         )
         return InsertResult(prefix_len=prefix_len)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
-        """Cache request when it finishes."""
+    def cache_finished_req(self, req: Req, is_insert: bool = True, split=None):
+        """Cache request when it finishes.
+
+        Args:
+            req: the finished request whose KV is being committed.
+            is_insert: when False, free the request's kv_indices without inserting them
+                into the radix tree (e.g. abort / retract paths).
+            split: when provided (a NoCacheThoughtsSplit from
+                ``sglang.srt.mem_cache.common.split_kv_for_no_cache_thoughts``), use the
+                split's virtual token ids / kv_indices / positions for the radix insert
+                instead of looking them up from the per-request KV slot. The thought
+                slice in ``split.thought_kv_indices_to_free`` is freed immediately. This
+                allows skipping thought tokens while preserving original RoPE positions
+                on the cached answer slice.
+        """
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
             is_insert = False
 
         kv_committed_len = req.pop_committed_kv_cache()
+
+        if split is not None:
+            # Skip the per-req KV-pool lookup; use the pre-computed virtual slice.
+            if self.disable or not is_insert:
+                self.token_to_kv_pool_allocator.free(split.virtual_kv_indices)
+                self.token_to_kv_pool_allocator.free(split.thought_kv_indices_to_free)
+                self.dec_lock_ref(req.last_node)
+                return
+            # Free the thought slice; it never enters the shared cache.
+            self.token_to_kv_pool_allocator.free(split.thought_kv_indices_to_free)
+            keys = (
+                convert_to_bigram_key(split.virtual_token_ids)
+                if self.is_eagle
+                else split.virtual_token_ids
+            )
+            keys = page_align_keys(keys, self.page_size)
+            values = split.virtual_kv_indices[: len(keys)].to(
+                dtype=torch.int64, copy=True
+            )
+            positions = split.virtual_positions[: len(keys)].to(
+                dtype=torch.int64, copy=True
+            )
+            radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+            priority = getattr(req, "priority", 0) or 0
+            result = self.insert(
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    priority=priority,
+                    original_positions=positions,
+                )
+            )
+            new_prefix_len = result.prefix_len
+            self.token_to_kv_pool_allocator.free(
+                split.virtual_kv_indices[req.cache_protected_len : new_prefix_len]
+            )
+            # Free any unaligned tail from the page_align trim.
+            self.token_to_kv_pool_allocator.free(split.virtual_kv_indices[len(keys) :])
+            self.dec_lock_ref(req.last_node)
+            return
+
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len

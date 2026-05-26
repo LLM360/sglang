@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
@@ -17,6 +17,35 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+
+
+def derive_extend_position_start(
+    extend_prefix_lens: List[int],
+    cached_positions_per_req: List[Optional["torch.Tensor"]],
+) -> Optional[List[int]]:
+    """Given per-request cached RoPE positions, return the starting RoPE position for
+    each request's extend (prefill) tokens.
+
+    Args:
+        extend_prefix_lens: per-request count of cached prefix tokens.
+        cached_positions_per_req: per-request tensor of cached original positions,
+            or None if no positions are cached for that request.
+
+    Returns:
+        None if every entry is None (i.e. no request has non-contiguous cached
+        positions, so the legacy contiguous-positions path applies). Otherwise a
+        list of per-request integer starts: max(cached_positions) + 1 when cached
+        positions exist, else extend_prefix_lens[i] (legacy).
+    """
+    if all(p is None for p in cached_positions_per_req):
+        return None
+    starts: List[int] = []
+    for prefix_len, positions in zip(extend_prefix_lens, cached_positions_per_req):
+        if positions is None or len(positions) == 0:
+            starts.append(int(prefix_len))
+        else:
+            starts.append(int(positions.max().item()) + 1)
+    return starts
 
 
 @dataclasses.dataclass
@@ -567,7 +596,25 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
-    tree_cache.cache_finished_req(req, is_insert=is_insert)
+    server_args = get_global_server_args()
+    if (
+        is_insert
+        and getattr(server_args, "no_cache_thoughts", False)
+        and getattr(req, "require_reasoning", False)
+        and getattr(req, "answer_start_position", None) is not None
+    ):
+        # Skip the thought tokens from the shared prefix cache; insert only the
+        # input + post-</think> answer slice, preserving original RoPE positions.
+        req_to_token_slot = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx]
+        split = split_kv_for_no_cache_thoughts(
+            origin_input_ids=req.origin_input_ids,
+            output_ids=req.output_ids,
+            req_to_token_slot=req_to_token_slot,
+            answer_start_position=req.answer_start_position,
+        )
+        tree_cache.cache_finished_req(req, is_insert=is_insert, split=split)
+    else:
+        tree_cache.cache_finished_req(req, is_insert=is_insert)
 
     # FIXME: SessionAwareCache.cache_finished_req sets req_pool_idx = None to
     # transfer KV ownership to the SessionSlot, so we skip the remaining

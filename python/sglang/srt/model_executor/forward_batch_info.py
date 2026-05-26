@@ -1105,8 +1105,20 @@ def compute_position(
     extend_prefix_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
+    extend_position_start: Optional[torch.Tensor] = None,
 ):
-    if support_triton(attn_backend):
+    """Compute positions for the extend (prefill) tokens.
+
+    extend_position_start (optional): per-request override for the starting RoPE
+    position of the extend tokens. When None, positions are contiguous and start
+    at extend_prefix_lens[i]. When provided, positions for request i are
+    [extend_position_start[i], extend_position_start[i] + 1, ...]; used by cache
+    hits whose cached entries carry non-contiguous original positions.
+    """
+    if support_triton(attn_backend) and extend_position_start is None:
+        # The fused triton kernel uses extend_prefix_lens as the position start.
+        # The override path is not yet implemented there; fall through to the
+        # torch path when an override is requested.
         positions, extend_start_loc = compute_position_triton(
             extend_prefix_lens,
             extend_seq_lens,
@@ -1114,7 +1126,7 @@ def compute_position(
         )
     else:
         positions, extend_start_loc = compute_position_torch(
-            extend_prefix_lens, extend_seq_lens
+            extend_prefix_lens, extend_seq_lens, extend_position_start
         )
     return positions, extend_start_loc
 
@@ -1176,14 +1188,32 @@ def compute_position_kernel(
 
 
 def compute_position_torch(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_position_start: Optional[torch.Tensor] = None,
 ):
+    """Compute per-token positions for the extend (prefill) tokens of a batch.
+
+    Args:
+        extend_prefix_lens: per-request count of cached prefix tokens (KV slot count).
+        extend_seq_lens: per-request count of new tokens being prefilled.
+        extend_position_start: optional per-request override for the first RoPE
+            position of the extend tokens. When None, positions start at
+            extend_prefix_lens[i] (contiguous: token i sits at RoPE position i).
+            When provided, positions for request i are
+            [extend_position_start[i], extend_position_start[i] + 1, ...]. This
+            supports cache hits whose stored kv has non-contiguous positions
+            (e.g. with gaps where thoughts were skipped).
+    """
+    starts = (
+        extend_position_start if extend_position_start is not None else extend_prefix_lens
+    )
     positions = torch.cat(
         [
             torch.arange(
-                prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device
+                start, start + extend_len, device=extend_prefix_lens.device
             )
-            for prefix_len, extend_len in zip(extend_prefix_lens, extend_seq_lens)
+            for start, extend_len in zip(starts, extend_seq_lens)
         ],
         axis=0,
     )
