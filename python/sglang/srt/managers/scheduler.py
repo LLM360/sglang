@@ -554,15 +554,8 @@ class Scheduler(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
             self._think_end_id = self.tokenizer.think_end_id
-            # think_start_id is consumed by --no-cache-thoughts at request finish to
-            # strip the chat-template's <think>... priming tail from origin_input_ids
-            # before inserting the cached prompt into the radix tree.
-            self._think_start_id = self.tokenizer.encode(
-                reasoning_parser.detector.think_start_token, add_special_tokens=False
-            )[0]
         else:
             self._think_end_id = None
-            self._think_start_id = None
 
     def init_mamba_backend(self) -> None:
         initialize_mamba_selective_state_update_backend(self.server_args)
@@ -1785,11 +1778,6 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
             )
             req.tokenizer = self.tokenizer
-            # Per-request copy so release_kv_cache (which doesn't have a scheduler
-            # reference) can find the <think> token id for the --no-cache-thoughts
-            # priming-tail stripping at request finish.
-            req._think_start_id = self._think_start_id
-
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if (
@@ -1835,7 +1823,6 @@ class Scheduler(
                 vocab_size=self.model_config.vocab_size,
             )
             req.tokenizer = self.tokenizer
-            req._think_start_id = self._think_start_id
             req.set_finish_with_abort(
                 f"Invalid request: session id {session_id} does not exist"
             )
@@ -2093,7 +2080,6 @@ class Scheduler(
             time_stats=recv_req.time_stats,
         )
         req.tokenizer = self.tokenizer
-        req._think_start_id = self._think_start_id
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:

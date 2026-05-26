@@ -68,48 +68,6 @@ class TestReleaseKvCacheRouting(unittest.TestCase):
         self.assertEqual(split.virtual_token_ids, [101, 102, 301, 302, 303])
         self.assertEqual(split.virtual_positions.tolist(), [0, 1, 6, 7, 8])
 
-    def test_propagates_think_start_id_from_req(self):
-        """When req carries _think_start_id, release_kv_cache must pass it through
-        to split_kv_for_no_cache_thoughts so the priming tail is stripped from the
-        cached prompt."""
-        tree = self._make_tree_cache_mock()
-        req = self._make_req_mock()
-        # Simulate add_generation_prompt having added <think>\\n (token id 500) as the
-        # last 2 tokens of origin_input_ids. Use a different prompt that ends with priming.
-        req.origin_input_ids = [101, 102, 500, 599]
-        req.output_ids = [201, 202, 203, 204, 301, 302, 303]
-        # Total len = 4 + 7 = 11; answer_start is at the same offset within output_ids.
-        # output_ids: [thought_1, thought_2, thought_3, </think>, X, Y, Z]
-        # answer_start_position is the absolute position right after </think>:
-        # 4 (input) + 4 (think+thoughts+/think) = 8
-        req.answer_start_position = 8
-        # think_start_id == 500 (the <think> opener)
-        req._think_start_id = 500
-        # req_to_token_slot covers 11 tokens.
-        tree.req_to_token_pool.req_to_token = torch.tensor(
-            [[100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110]],
-            dtype=torch.int64,
-        )
-
-        fake_server_args = MagicMock()
-        fake_server_args.no_cache_thoughts = True
-        fake_server_args.page_size = 1
-        fake_server_args.speculative_algorithm = None
-
-        with patch(
-            "sglang.srt.mem_cache.common.get_global_server_args",
-            return_value=fake_server_args,
-        ):
-            release_kv_cache(req, tree, is_insert=True)
-
-        split = tree.cache_finished_req.call_args.kwargs.get("split")
-        self.assertIsNotNone(split)
-        # Priming tail (slots 2, 3 — the <think>\\n tokens) excluded from cached prompt.
-        # Cached prompt: [101, 102] from positions [0, 1].
-        # Answer: [301, 302, 303] from positions [8, 9, 10].
-        self.assertEqual(split.virtual_token_ids, [101, 102, 301, 302, 303])
-        self.assertEqual(split.virtual_positions.tolist(), [0, 1, 8, 9, 10])
-
     def test_no_split_when_flag_off(self):
         tree = self._make_tree_cache_mock()
         req = self._make_req_mock()  # has require_reasoning + answer_start_position set
