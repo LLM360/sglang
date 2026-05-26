@@ -544,7 +544,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
-                ret.positions = clamp_position(batch.seq_lens)
+                ret.positions = clamp_position(
+                    batch.seq_lens,
+                    position_offsets=getattr(batch, "position_offsets", None),
+                )
         else:
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
@@ -1267,13 +1270,34 @@ def compute_position_torch(
     return positions.to(torch.int64), extend_start_loc
 
 
-def _clamp_position_native(seq_lens):
-    return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+def _clamp_position_native(seq_lens, position_offsets: Optional[torch.Tensor] = None):
+    """Per-token decode position = clamp(seq_lens - 1, 0).
+
+    Args:
+        seq_lens: per-request sequence length (token count).
+        position_offsets: optional per-request RoPE offset that shifts each
+            position. Used after a cache hit whose cached entry carried
+            non-contiguous RoPE positions: the offset is
+            max(cached_positions) - (prefix_token_count - 1), capturing the
+            gap in RoPE space caused by skipped thought tokens. When None,
+            behavior matches the legacy contiguous-positions path.
+    """
+    base = torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+    if position_offsets is not None:
+        base = base + position_offsets.to(torch.int64)
+    return base
 
 
 if is_cuda() or is_hip():
     from sglang.jit_kernel.clamp_position import clamp_position_cuda
 
-    clamp_position = clamp_position_cuda
+    def clamp_position(
+        seq_lens: torch.Tensor,
+        position_offsets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        base = clamp_position_cuda(seq_lens)
+        if position_offsets is not None:
+            base = base + position_offsets.to(torch.int64)
+        return base
 else:
     clamp_position = _clamp_position_native

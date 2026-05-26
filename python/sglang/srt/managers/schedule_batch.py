@@ -1409,6 +1409,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # carried non-contiguous positions (e.g. from --no-cache-thoughts). None means no
     # request in the batch has such positions; the contiguous-positions path applies.
     cached_positions_per_req: Optional[List[Optional[torch.Tensor]]] = None
+    # Per-request RoPE offset (one int per req, device tensor) added to (seq_len - 1)
+    # at decode time so decode positions continue from where a non-contiguous prefill
+    # cache hit left off. None when no req in the batch needs an offset.
+    position_offsets: Optional[torch.Tensor] = None
     extend_lens: List[int] = None
     extend_num_tokens: Optional[int] = None
     decoding_reqs: List[Req] = None
@@ -1641,6 +1645,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
         self.cached_positions_per_req = collect_cached_positions(reqs)
+        if self.cached_positions_per_req is not None:
+            from sglang.srt.mem_cache.common import derive_position_offsets
+
+            offsets_list = derive_position_offsets(
+                prefix_lens, self.cached_positions_per_req
+            )
+            if offsets_list is not None:
+                self.position_offsets = torch.tensor(
+                    offsets_list, dtype=torch.int64, pin_memory=_pin
+                ).to(self.device, non_blocking=True)
         self.extend_lens = extend_lens
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu

@@ -19,6 +19,33 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 
+def derive_position_offsets(
+    extend_prefix_lens: List[int],
+    cached_positions_per_req: List[Optional["torch.Tensor"]],
+) -> Optional[List[int]]:
+    """Given per-request cached RoPE positions, return a per-request offset to add
+    to (seq_len - 1) at decode time so decode positions continue from where the
+    non-contiguous prefill cache hit left off.
+
+    The offset captures the gap in RoPE space caused by tokens that exist in the
+    cached entry's position layout but not in the contiguous-token-count layout:
+        offset[i] = max(cached_positions[i]) - (extend_prefix_lens[i] - 1)
+    A request without cached positions contributes 0 (no offset).
+
+    Returns None if every entry is None (i.e. no request in the batch needs an
+    offset; the legacy clamp(seq_lens - 1) path applies).
+    """
+    if all(p is None for p in cached_positions_per_req):
+        return None
+    offsets: List[int] = []
+    for prefix_len, positions in zip(extend_prefix_lens, cached_positions_per_req):
+        if positions is None or len(positions) == 0:
+            offsets.append(0)
+        else:
+            offsets.append(int(positions.max().item()) - (int(prefix_len) - 1))
+    return offsets
+
+
 def derive_extend_position_start(
     extend_prefix_lens: List[int],
     cached_positions_per_req: List[Optional["torch.Tensor"]],
