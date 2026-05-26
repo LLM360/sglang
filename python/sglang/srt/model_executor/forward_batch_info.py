@@ -555,11 +555,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
-            positions, ret.extend_start_loc = compute_position(
-                model_runner.server_args.attention_backend,
-                ret.extend_prefix_lens,
-                ret.extend_seq_lens,
-                ret.extend_num_tokens,
+            # Honor per-request cached non-contiguous positions from cache hits when
+            # available; otherwise behaves identically to compute_position.
+            positions, ret.extend_start_loc = build_extend_positions(
+                attn_backend=model_runner.server_args.attention_backend,
+                extend_prefix_lens=ret.extend_prefix_lens,
+                extend_seq_lens=ret.extend_seq_lens,
+                extend_num_tokens=ret.extend_num_tokens,
+                extend_prefix_lens_cpu=batch.extend_prefix_lens,
+                cached_positions_per_req=getattr(
+                    batch, "cached_positions_per_req", None
+                ),
+                device=device,
             )
             if ret.positions is None:
                 ret.positions = positions
@@ -1098,6 +1105,44 @@ class PPProxyTensors:
 
     def __repr__(self) -> str:
         return f"PPProxyTensors(tensors={self.tensors})"
+
+
+def build_extend_positions(
+    attn_backend: str,
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_num_tokens: int,
+    extend_prefix_lens_cpu: List[int],
+    cached_positions_per_req: Optional[List[Optional[torch.Tensor]]],
+    device,
+):
+    """Build extend-token positions, honoring per-request cached non-contiguous positions.
+
+    Returns (positions, extend_start_loc) matching compute_position's signature. When
+    cached_positions_per_req is None or contains only None entries, positions are
+    contiguous (legacy behavior). Otherwise the per-request start position is
+    max(cached_positions[i]) + 1 for cached requests, and extend_prefix_lens_cpu[i]
+    for non-cached requests.
+    """
+    from sglang.srt.mem_cache.common import derive_extend_position_start
+
+    extend_position_start_tensor = None
+    if cached_positions_per_req is not None:
+        starts = derive_extend_position_start(
+            extend_prefix_lens_cpu, cached_positions_per_req
+        )
+        if starts is not None:
+            extend_position_start_tensor = torch.tensor(
+                starts, dtype=torch.int64
+            ).to(device, non_blocking=True)
+
+    return compute_position(
+        attn_backend,
+        extend_prefix_lens,
+        extend_seq_lens,
+        extend_num_tokens,
+        extend_position_start=extend_position_start_tensor,
+    )
 
 
 def compute_position(

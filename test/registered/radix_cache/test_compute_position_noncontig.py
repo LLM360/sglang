@@ -52,7 +52,7 @@ class TestComputePositionNonContiguous(unittest.TestCase):
         # routes to compute_position_triton when support_triton(attn_backend) is True
         # on CUDA hosts. The torch path is the unambiguous behavioral test.
         positions, _ = compute_position(
-            attn_backend="aiter",  # not triton-supported -> takes torch path
+            attn_backend="torch_native",  # not triton-supported -> takes torch path
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_sum=3,
