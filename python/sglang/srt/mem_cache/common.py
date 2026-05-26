@@ -19,6 +19,25 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 
+_split_unsupported_warned = set()
+
+
+def warn_split_unsupported_once(backend_name: str) -> None:
+    """Emit a one-time warning when a prefix-cache backend that does not implement
+    --no-cache-thoughts split insertion receives a split kwarg. The split is dropped
+    and the backend falls back to its default cache_finished_req behavior, so the
+    feature gracefully no-ops on that backend.
+    """
+    if backend_name in _split_unsupported_warned:
+        return
+    _split_unsupported_warned.add(backend_name)
+    logger.warning(
+        "%s does not implement --no-cache-thoughts split insertion; "
+        "thoughts will be cached normally on this backend (no-op).",
+        backend_name,
+    )
+
+
 def derive_position_offsets(
     extend_prefix_lens: List[int],
     cached_positions_per_req: List[Optional["torch.Tensor"]],
