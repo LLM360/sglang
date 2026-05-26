@@ -640,6 +640,11 @@ class Req(ReqDllmMixin):
         # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
         self._is_reasoning_over = False
         self.reasoning_tokens = 0
+        # Absolute position (in the origin_input_ids + output_ids index space) of the
+        # first token after </think>. Set by update_reasoning_tokens when the </think>
+        # boundary is detected; consumed at request finish under --no-cache-thoughts to
+        # split the request's KV between freed-only thoughts and radix-inserted answer.
+        self.answer_start_position: Optional[int] = None
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -1291,6 +1296,10 @@ class Req(ReqDllmMixin):
             end_pos = token_id.index(think_end_id)
             self.reasoning_tokens += end_pos + 1
             self._is_reasoning_over = True
+            # The answer begins immediately after </think>. Position is in the absolute
+            # token-index space (origin_input_ids + output_ids), which equals the RoPE
+            # position when the request was decoded with contiguous positions.
+            self.answer_start_position = len(self.origin_input_ids) + self.reasoning_tokens
         except ValueError:
             self.reasoning_tokens += len(token_id)
 

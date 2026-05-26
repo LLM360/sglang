@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 import torch
 import triton
@@ -16,6 +17,96 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+
+
+@dataclasses.dataclass
+class NoCacheThoughtsSplit:
+    """Result of splitting a finished reasoning request's KV into the radix-bound slice
+    and the freed-only thought slice.
+
+    The cache_finished_req path consumes virtual_token_ids/positions/kv_indices to
+    register the answer in the radix tree with its original positions preserved,
+    then frees thought_kv_indices_to_free directly to the allocator.
+    """
+
+    virtual_token_ids: List[int]
+    virtual_kv_indices: torch.Tensor
+    virtual_positions: torch.Tensor
+    thought_kv_indices_to_free: torch.Tensor
+
+
+def split_kv_for_no_cache_thoughts(
+    origin_input_ids: List[int],
+    output_ids: List[int],
+    req_to_token_slot: torch.Tensor,
+    answer_start_position: int,
+) -> NoCacheThoughtsSplit:
+    """Compute the split-insertion tensors for a finished reasoning request.
+
+    When --no-cache-thoughts is enabled and a request emits `</think>`, the tokens
+    between input_end and the `</think>` boundary are thoughts that must NOT be
+    registered in the cross-request radix cache; the post-`</think>` answer must
+    be inserted with the original RoPE positions preserved.
+
+    Args:
+        origin_input_ids: input token ids (positions 0..len(input)-1).
+        output_ids: generated token ids (positions len(input)..len(input)+len(output)-1).
+        req_to_token_slot: 1D tensor of kv_indices, one per token in the request's
+            sequence (length must be >= len(origin_input_ids) + len(output_ids)).
+        answer_start_position: absolute position (in the input+output index space)
+            of the first answer token, i.e. the token immediately after `</think>`.
+
+    Returns:
+        NoCacheThoughtsSplit with:
+        * virtual_token_ids: input + post-`</think>` answer (thoughts removed).
+        * virtual_kv_indices: kv_indices for those tokens, gathered from req_to_token_slot.
+        * virtual_positions: matching original RoPE positions; non-contiguous between
+          input_len-1 and answer_start_position.
+        * thought_kv_indices_to_free: kv_indices for slots covering the thought slice.
+
+    When answer_start_position >= len(input) + len(output), the answer hasn't been
+    generated yet (e.g. the request was cut off mid-thought) and the result contains
+    only the input prompt slice.
+    """
+    input_len = len(origin_input_ids)
+    total_len = input_len + len(output_ids)
+
+    # Clamp answer_start so we behave sanely if reasoning never finished.
+    answer_start = min(answer_start_position, total_len)
+
+    # Slots / positions for input + post-</think> answer.
+    answer_count = max(total_len - answer_start, 0)
+    answer_output_offset = answer_start - input_len  # index into output_ids
+
+    virtual_token_ids = list(origin_input_ids) + list(
+        output_ids[answer_output_offset:] if answer_count > 0 else []
+    )
+
+    kept_slot_indices = list(range(input_len)) + list(range(answer_start, total_len))
+    kept_positions = list(range(input_len)) + list(range(answer_start, total_len))
+    thought_slot_indices = list(range(input_len, answer_start))
+
+    device = req_to_token_slot.device
+    if kept_slot_indices:
+        idx_tensor = torch.tensor(kept_slot_indices, dtype=torch.int64, device=device)
+        virtual_kv_indices = req_to_token_slot[idx_tensor].to(torch.int64).clone()
+    else:
+        virtual_kv_indices = torch.empty((0,), dtype=torch.int64, device=device)
+
+    virtual_positions = torch.tensor(kept_positions, dtype=torch.int64, device=device)
+
+    if thought_slot_indices:
+        t_idx = torch.tensor(thought_slot_indices, dtype=torch.int64, device=device)
+        thought_kv_indices_to_free = req_to_token_slot[t_idx].to(torch.int64).clone()
+    else:
+        thought_kv_indices_to_free = torch.empty((0,), dtype=torch.int64, device=device)
+
+    return NoCacheThoughtsSplit(
+        virtual_token_ids=virtual_token_ids,
+        virtual_kv_indices=virtual_kv_indices,
+        virtual_positions=virtual_positions,
+        thought_kv_indices_to_free=thought_kv_indices_to_free,
+    )
 
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
