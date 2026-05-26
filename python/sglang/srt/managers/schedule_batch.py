@@ -554,6 +554,19 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
+def collect_cached_positions(reqs):
+    """Aggregate per-request cached non-contiguous RoPE positions across a batch.
+
+    Returns a per-request list of Optional[torch.Tensor] when at least one request
+    has cached positions; None otherwise (signal to ForwardBatch.init_new that the
+    legacy contiguous-positions path applies).
+    """
+    positions = [getattr(r, "cached_positions", None) for r in reqs]
+    if all(p is None for p in positions):
+        return None
+    return positions
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -645,6 +658,13 @@ class Req(ReqDllmMixin):
         # boundary is detected; consumed at request finish under --no-cache-thoughts to
         # split the request's KV between freed-only thoughts and radix-inserted answer.
         self.answer_start_position: Optional[int] = None
+        # Per-token original RoPE positions for the prefix matched in the radix cache.
+        # Set by init_next_round_input when match_prefix returns non-None positions
+        # (i.e. the cached entry was inserted with non-contiguous positions, e.g. via
+        # the --no-cache-thoughts split path). Consumed at batch construction so the
+        # ForwardBatch's positions tensor lines up with the rotation baked into the
+        # cached K vectors. None means "use legacy contiguous positions".
+        self.cached_positions: Optional[torch.Tensor] = None
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -1001,6 +1021,7 @@ class Req(ReqDllmMixin):
                 match_result.host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            self.cached_positions = match_result.original_positions
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len
             else:
@@ -1384,6 +1405,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For extend and mixed chunekd prefill
     prefix_lens: List[int] = None
+    # Per-request original RoPE positions for the matched prefix when the cache hit
+    # carried non-contiguous positions (e.g. from --no-cache-thoughts). None means no
+    # request in the batch has such positions; the contiguous-positions path applies.
+    cached_positions_per_req: Optional[List[Optional[torch.Tensor]]] = None
     extend_lens: List[int] = None
     extend_num_tokens: Optional[int] = None
     decoding_reqs: List[Req] = None
@@ -1615,6 +1640,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
+        self.cached_positions_per_req = collect_cached_positions(reqs)
         self.extend_lens = extend_lens
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
