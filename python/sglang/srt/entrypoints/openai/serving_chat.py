@@ -258,18 +258,6 @@ class OpenAIServingChat(OpenAIServingBase):
             request.reasoning_effort = reasoning_effort
 
         """Convert OpenAI chat completion request to internal format"""
-        if request.return_prompt_token_ids and request.stream:
-            raise ValueError(
-                "return_prompt_token_ids is not supported with streaming. "
-                "Please set stream=false when using return_prompt_token_ids=true."
-            )
-
-        if request.return_completion_token_ids and request.stream:
-            raise ValueError(
-                "return_completion_token_ids is not supported with streaming. "
-                "Please set stream=false when using return_completion_token_ids=true."
-            )
-
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
@@ -682,6 +670,12 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
 
+        # TITO token-id tracking (only populated when requested).
+        # prompt_token_ids is constant per request — overwrite each chunk.
+        # output_ids is incremental in streaming — extend each chunk.
+        prompt_token_ids: dict = {}
+        completion_token_ids: dict = {}
+
         stream_started = False
         try:
             include_usage, continuous_usage_stats = should_include_usage(
@@ -704,6 +698,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+
+                if request.return_prompt_token_ids:
+                    ptids = content.get("prompt_token_ids")
+                    if ptids is not None:
+                        prompt_token_ids[index] = ptids
+                if request.return_completion_token_ids:
+                    oids = content.get("output_ids")
+                    if oids:
+                        completion_token_ids.setdefault(index, []).extend(oids)
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -867,6 +870,8 @@ class OpenAIServingChat(OpenAIServingBase):
                                 if "matched" in finish_reason_data
                                 else None
                             ),
+                            prompt_token_ids=prompt_token_ids.get(idx),
+                            completion_token_ids=completion_token_ids.get(idx),
                         )
                     ],
                     model=request.model,

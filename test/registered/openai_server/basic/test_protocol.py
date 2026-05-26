@@ -22,8 +22,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
+    ChatCompletionResponseStreamChoice,
+    ChatCompletionStreamResponse,
     ChatMessage,
     CompletionRequest,
+    DeltaMessage,
     ModelCard,
     ModelList,
     UsageInfo,
@@ -402,6 +405,73 @@ class TestCompletionTokenIds(unittest.TestCase):
         )
         data = response.model_dump()
         self.assertIn("completion_token_ids", data["choices"][0])
+        self.assertEqual(data["choices"][0]["completion_token_ids"], [10, 20, 30])
+
+
+class TestCompletionTokenIdsStreaming(unittest.TestCase):
+    """Streaming-side parallel of TestCompletionTokenIds.
+
+    The TITO multi-turn workflow needs `completion_token_ids` and
+    `prompt_token_ids` returned even when `stream=true`, so they have to
+    live on `ChatCompletionResponseStreamChoice` as well — and be dropped
+    from serialization when None to keep regular streams unchanged.
+    """
+
+    def _stream_response(self, choice):
+        return ChatCompletionStreamResponse(
+            id="test-id",
+            model="test-model",
+            choices=[choice],
+        )
+
+    def test_stream_choice_accepts_completion_token_ids(self):
+        choice = ChatCompletionResponseStreamChoice(
+            index=0,
+            delta=DeltaMessage(role="assistant", content=""),
+            finish_reason="stop",
+            completion_token_ids=[10, 20, 30],
+        )
+        self.assertEqual(choice.completion_token_ids, [10, 20, 30])
+
+    def test_stream_choice_accepts_prompt_token_ids(self):
+        choice = ChatCompletionResponseStreamChoice(
+            index=0,
+            delta=DeltaMessage(role="assistant", content=""),
+            finish_reason="stop",
+            prompt_token_ids=[1, 2, 3, 4],
+        )
+        self.assertEqual(choice.prompt_token_ids, [1, 2, 3, 4])
+
+    def test_stream_completion_token_ids_dropped_when_none(self):
+        choice = ChatCompletionResponseStreamChoice(
+            index=0,
+            delta=DeltaMessage(role="assistant", content=""),
+            finish_reason="stop",
+            completion_token_ids=None,
+        )
+        data = self._stream_response(choice).model_dump()
+        self.assertNotIn("completion_token_ids", data["choices"][0])
+
+    def test_stream_prompt_token_ids_dropped_when_none(self):
+        choice = ChatCompletionResponseStreamChoice(
+            index=0,
+            delta=DeltaMessage(role="assistant", content=""),
+            finish_reason="stop",
+            prompt_token_ids=None,
+        )
+        data = self._stream_response(choice).model_dump()
+        self.assertNotIn("prompt_token_ids", data["choices"][0])
+
+    def test_stream_token_ids_kept_when_set(self):
+        choice = ChatCompletionResponseStreamChoice(
+            index=0,
+            delta=DeltaMessage(role="assistant", content=""),
+            finish_reason="stop",
+            prompt_token_ids=[1, 2, 3, 4],
+            completion_token_ids=[10, 20, 30],
+        )
+        data = self._stream_response(choice).model_dump()
+        self.assertEqual(data["choices"][0]["prompt_token_ids"], [1, 2, 3, 4])
         self.assertEqual(data["choices"][0]["completion_token_ids"], [10, 20, 30])
 
 

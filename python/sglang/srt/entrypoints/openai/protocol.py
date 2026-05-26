@@ -914,6 +914,17 @@ class ChatCompletionResponseStreamChoice(BaseModel):
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+    prompt_token_ids: Optional[List[int]] = None
+    completion_token_ids: Optional[List[int]] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.prompt_token_ids is None:
+            data.pop("prompt_token_ids", None)
+        if self.completion_token_ids is None:
+            data.pop("completion_token_ids", None)
+        return data
 
 
 class ChatCompletionStreamResponse(BaseModel):
