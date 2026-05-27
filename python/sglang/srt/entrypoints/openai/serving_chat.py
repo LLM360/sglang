@@ -706,7 +706,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 if request.return_completion_token_ids:
                     oids = content.get("output_ids")
                     if oids:
-                        completion_token_ids.setdefault(index, []).extend(oids)
+                        # tokenizer_manager emits per-chunk output_ids as
+                        # either the cumulative-so-far list (default) or
+                        # just the new incremental slice (only when
+                        # --incremental-streaming-output is set). Detect
+                        # which and accumulate correctly.
+                        if (self.tokenizer_manager.server_args
+                                .incremental_streaming_output):
+                            completion_token_ids.setdefault(
+                                index, []
+                            ).extend(oids)
+                        else:
+                            completion_token_ids[index] = list(oids)
 
                 # Handle logprobs
                 choice_logprobs = None
