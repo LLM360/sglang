@@ -578,51 +578,66 @@ async def sweep_n(
         ("tito_nct", nct_url, "tito"),
     ]
     out: dict[int, dict[str, list[ConversationResult]]] = {}
-    total_turns_target = sum(n_values) * k_trials * len(BACKENDS)
-    completed_turns = 0
-    completed_convs = 0
-    total_convs = len(n_values) * k_trials * len(BACKENDS)
     started_at = time.perf_counter()
+    # Per-N condition we launch K × len(BACKENDS) conversations concurrently
+    # so the sglang servers can apply continuous batching. Max concurrent
+    # per server:
+    #   - no-flag (bl_url): K conversations × 2 conditions = 2K concurrent
+    #     (realistic + tito_baseline)
+    #   - flag-on (nct_url): K concurrent (tito_nct only)
+    # Keep K small enough that the flag-on server stays under the B=16
+    # memory-leak threshold (see KNOWN_ISSUES_no_cache_thoughts.md).
 
-    async with aiohttp.ClientSession() as sess:
-        for n in n_values:
-            n_idx = n_values.index(n) + 1
+    async with aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(limit=256),
+    ) as sess:
+        for n_idx, n in enumerate(n_values, start=1):
+            n_start = time.perf_counter()
+            n_total = k_trials * len(BACKENDS)
             print(
-                f"\n[N-sweep] N={n}  K={k_trials}   "
-                f"(condition {n_idx}/{len(n_values)})",
+                f"\n[N-sweep] N={n} K={k_trials} ({n_idx}/{len(n_values)}) "
+                f"— launching {n_total} concurrent convs "
+                f"({k_trials} per backend × 3 backends)",
                 flush=True,
             )
-            out[n] = {label: [] for label, _, _ in BACKENDS}
+
+            # Build all tasks for this N condition.
+            tasks: list = []
+            order: list[tuple[int, str]] = []  # (seed_idx, label) in launch order
             for seed in range(k_trials):
                 for label, url, mode in BACKENDS:
-                    conv_start = time.perf_counter()
-                    print(
-                        f"  [{completed_convs + 1:>3}/{total_convs}] "
-                        f"seed={seed} {label}...", end="", flush=True,
+                    tasks.append(
+                        run_conversation(
+                            sess, url, model, tokenizer,
+                            seed_idx=seed, n_turns=n,
+                            max_tokens=max_tokens,
+                            backend_label=label,
+                            mode=mode,
+                        )
                     )
-                    r = await run_conversation(
-                        sess, url, model, tokenizer,
-                        seed_idx=seed, n_turns=n,
-                        max_tokens=max_tokens,
-                        backend_label=label,
-                        mode=mode,
-                    )
-                    conv_wall = time.perf_counter() - conv_start
-                    out[n][label].append(r)
-                    completed_convs += 1
-                    completed_turns += len(r.turns)
-                    err_str = ""
-                    if any(t.error for t in r.turns):
-                        err_str = f" ERROR: {next(t.error for t in r.turns if t.error)}"
-                    elapsed = time.perf_counter() - started_at
-                    s_per_turn = elapsed / max(1, completed_turns)
-                    remaining_turns = total_turns_target - completed_turns
-                    eta = remaining_turns * s_per_turn
-                    print(
-                        f" {conv_wall:.1f}s ({len(r.turns)} turns){err_str}   "
-                        f"[elapsed {_fmt_eta(elapsed)}  eta {_fmt_eta(eta)}]",
-                        flush=True,
-                    )
+                    order.append((seed, label))
+
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+
+            out[n] = {label: [] for label, _, _ in BACKENDS}
+            for (seed, label), r in zip(order, results):
+                out[n][label].append(r)
+
+            n_wall = time.perf_counter() - n_start
+            elapsed = time.perf_counter() - started_at
+            print(f"  N={n} done in {n_wall:.1f}s wall (concurrent batch)",
+                  flush=True)
+            for label, _, _ in BACKENDS:
+                runs = out[n][label]
+                walls = [r.total_step_s for r in runs]
+                errors = sum(1 for r in runs if any(t.error for t in r.turns))
+                wm = statistics.mean(walls) if walls else 0.0
+                print(
+                    f"    {label:<16} per-conv mean step-sum={wm:.1f}s   "
+                    f"errors={errors}",
+                    flush=True,
+                )
+            print(f"  [elapsed {_fmt_eta(elapsed)}]", flush=True)
     return out
 
 
@@ -859,16 +874,19 @@ def main() -> None:
     ap.add_argument("--tokenizer-path", default=None,
                     help="HF tokenizer path. Defaults to --model.")
     ap.add_argument("--n-values", type=int, nargs="+",
-                    default=[1, 3, 5, 10, 20, 50])
+                    default=[1, 3, 5, 10])
     ap.add_argument("--b-values", type=int, nargs="+",
                     default=[1, 4, 16, 64, 256])
-    ap.add_argument("--k-trials-n", type=int, default=5,
-                    help="Trials per N condition (B=1 sweep)")
+    ap.add_argument("--k-trials-n", type=int, default=3,
+                    help="Trials per N condition (concurrent within each N)")
     ap.add_argument("--k-trials-b", type=int, default=3,
                     help="Trials per B condition (N-fixed sweep)")
     ap.add_argument("--n-fixed-for-b-sweep", type=int, default=10)
-    ap.add_argument("--max-tokens", type=int, default=512,
-                    help="Per-turn max_tokens cap; keeps step latency predictable")
+    ap.add_argument("--max-tokens", type=int, default=8192,
+                    help="Per-turn max_tokens cap. Default 8192 gives the "
+                         "reasoning model enough headroom to close </think> "
+                         "and emit an answer; smaller values truncate "
+                         "reasoning mid-thought and skew the comparison.")
     ap.add_argument("--skip-n-sweep", action="store_true")
     ap.add_argument("--skip-b-sweep", action="store_true")
     ap.add_argument("--output-json", default=None)
