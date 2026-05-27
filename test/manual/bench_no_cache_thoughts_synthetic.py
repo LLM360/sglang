@@ -94,11 +94,17 @@ class TitoSession:
         return env_delta
 
     def _render(self, add_generation_prompt: bool) -> list[int]:
-        return self.tokenizer.apply_chat_template(
-            self.messages, tokenize=True,
+        # NOTE: BBQ/K2V3's tokenizer's apply_chat_template(tokenize=True)
+        # returns a BatchEncoding wrapping a tokenizers.Encoding, NOT a
+        # list[int] like most HF tokenizers. Render to text first, then
+        # encode separately — that always returns list[int] regardless
+        # of which tokenizer we're talking to.
+        text = self.tokenizer.apply_chat_template(
+            self.messages, tokenize=False,
             add_generation_prompt=add_generation_prompt,
             **self.chat_template_kwargs,
         )
+        return list(self.tokenizer.encode(text, add_special_tokens=False))
 
 
 # Synthetic conversation construction
@@ -327,12 +333,16 @@ async def run_conversation(
 
         if use_tito:
             if tito is None:
-                # Need prompt_token_ids from server response to seed. We
-                # didn't capture them above — re-derive from tokenizer for
-                # the messages we sent. Since temperature=0 and server uses
-                # same tokenizer, this should match exactly.
-                seed_prompt_ids = tokenizer.apply_chat_template(
-                    initial, tokenize=True, add_generation_prompt=True,
+                # Re-derive turn-1 prompt_token_ids client-side via the
+                # render-then-encode path (apply_chat_template with
+                # tokenize=True returns BatchEncoding on this tokenizer,
+                # not list[int]). At temperature=0 + same tokenizer, the
+                # IDs match what the server saw.
+                seed_text = tokenizer.apply_chat_template(
+                    initial, tokenize=False, add_generation_prompt=True,
+                )
+                seed_prompt_ids = list(
+                    tokenizer.encode(seed_text, add_special_tokens=False)
                 )
                 tito = TitoSession(tokenizer)
                 tito.seed(
