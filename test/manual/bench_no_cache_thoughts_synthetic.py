@@ -296,10 +296,11 @@ class TurnMetrics:
     completion_tokens: int
     reasoning_tokens: int
     error: str | None = None
-    # Truncated previews of the generation so we can diagnose
-    # length / quality divergence between backends post-hoc.
-    content_preview: str = ""
-    reasoning_preview: str = ""
+    # Full generation text — captured so we can diagnose length / quality
+    # divergence between backends post-hoc. Sized at ~3-5 MB total per
+    # bench run (well within JSON sanity).
+    content_full: str = ""
+    reasoning_full: str = ""
 
     @property
     def decode_s(self) -> float | None:
@@ -413,10 +414,8 @@ async def _stream_chat(
         completion_tokens=len(completion_token_ids),
         reasoning_tokens=reasoning_tokens,
         error=error,
-        # Keep first 400 chars of each — enough to spot length divergence
-        # and detect OOD garbled output without ballooning the JSON.
-        content_preview=content_buf[:400],
-        reasoning_preview=reasoning_buf[:400],
+        content_full=content_buf,
+        reasoning_full=reasoning_buf,
     )
     return metrics, content_buf, reasoning_buf, completion_token_ids, reasoning_tokens
 
@@ -923,8 +922,8 @@ def main() -> None:
                      "prompt_tokens": t.prompt_tokens, "cached_tokens": t.cached_tokens,
                      "completion_tokens": t.completion_tokens,
                      "reasoning_tokens": t.reasoning_tokens, "error": t.error,
-                     "content_preview": t.content_preview,
-                     "reasoning_preview": t.reasoning_preview}
+                     "content_full": t.content_full,
+                     "reasoning_full": t.reasoning_full}
                     for t in r.turns
                 ],
             }
