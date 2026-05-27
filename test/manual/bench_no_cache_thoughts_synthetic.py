@@ -374,6 +374,14 @@ def ci95(xs: list[float]) -> float:
 # Sweep runners
 # -------------
 
+def _fmt_eta(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}min"
+    return f"{seconds / 3600:.1f}h"
+
+
 async def sweep_n(
     nct_url: str,
     bl_url: str,
@@ -384,18 +392,39 @@ async def sweep_n(
     max_tokens: int,
 ) -> dict:
     """N-sweep at batch=1: for each N value, run K trials per backend
-    sequentially. Returns nested dict[n_value][backend] -> list[ConversationResult]."""
+    sequentially. Returns nested dict[n_value][backend] -> list[ConversationResult].
+
+    Progress tracking: total work is sum(n) * K * 2 (since each turn takes
+    ~constant time, total turns is a better unit than total conversations).
+    After each conversation we update the running mean of seconds-per-turn
+    and project the remaining turns.
+    """
     out: dict[int, dict[str, list[ConversationResult]]] = {}
+    total_turns_target = sum(n_values) * k_trials * 2  # × 2 backends
+    completed_turns = 0
+    completed_convs = 0
+    total_convs = len(n_values) * k_trials * 2
+    started_at = time.perf_counter()
+
     async with aiohttp.ClientSession() as sess:
         for n in n_values:
-            print(f"\n[N-sweep] N={n}  K={k_trials}", flush=True)
+            n_idx = n_values.index(n) + 1
+            print(
+                f"\n[N-sweep] N={n}  K={k_trials}   "
+                f"(condition {n_idx}/{len(n_values)})",
+                flush=True,
+            )
             out[n] = {"baseline": [], "no_cache_thoughts": []}
             for seed in range(k_trials):
                 for label, url, use_tito in [
                     ("baseline", bl_url, False),
                     ("no_cache_thoughts", nct_url, True),
                 ]:
-                    print(f"  seed={seed} {label}...", end="", flush=True)
+                    conv_start = time.perf_counter()
+                    print(
+                        f"  [{completed_convs + 1:>3}/{total_convs}] "
+                        f"seed={seed} {label}...", end="", flush=True,
+                    )
                     r = await run_conversation(
                         sess, url, model, tokenizer,
                         seed_idx=seed, n_turns=n,
@@ -403,11 +432,22 @@ async def sweep_n(
                         use_tito=use_tito,
                         backend_label=label,
                     )
+                    conv_wall = time.perf_counter() - conv_start
                     out[n][label].append(r)
+                    completed_convs += 1
+                    completed_turns += len(r.turns)
                     err_str = ""
                     if any(t.error for t in r.turns):
                         err_str = f" ERROR: {next(t.error for t in r.turns if t.error)}"
-                    print(f" {r.total_step_s:.1f}s{err_str}", flush=True)
+                    elapsed = time.perf_counter() - started_at
+                    s_per_turn = elapsed / max(1, completed_turns)
+                    remaining_turns = total_turns_target - completed_turns
+                    eta = remaining_turns * s_per_turn
+                    print(
+                        f" {conv_wall:.1f}s ({len(r.turns)} turns){err_str}   "
+                        f"[elapsed {_fmt_eta(elapsed)}  eta {_fmt_eta(eta)}]",
+                        flush=True,
+                    )
     return out
 
 
@@ -422,13 +462,31 @@ async def sweep_b(
     max_tokens: int,
 ) -> dict:
     """B-sweep at fixed N: for each B value, fire B concurrent conversations
-    per backend. K trials = K repetitions of the B-batch."""
+    per backend. K trials = K repetitions of the B-batch.
+
+    Progress tracking: total work is sum(b) * k_trials * 2 * N_fixed turns.
+    After each trial we project remaining time at the running per-turn rate.
+    Trials at large B finish faster per-turn (concurrency), so the ETA may
+    be conservative early in the sweep.
+    """
     out: dict[int, dict[str, list[list[ConversationResult]]]] = {}
+    total_turns_target = sum(b_values) * k_trials * 2 * n_turns_fixed
+    completed_turns = 0
+    total_trials = len(b_values) * k_trials * 2
+    completed_trials = 0
+    started_at = time.perf_counter()
+
     async with aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(limit=512),
     ) as sess:
         for b in b_values:
-            print(f"\n[B-sweep] B={b}  N={n_turns_fixed}  K={k_trials}", flush=True)
+            b_idx = b_values.index(b) + 1
+            print(
+                f"\n[B-sweep] B={b}  N={n_turns_fixed}  K={k_trials}   "
+                f"(condition {b_idx}/{len(b_values)})  "
+                f"— each trial = {b} concurrent {n_turns_fixed}-turn convs",
+                flush=True,
+            )
             out[b] = {"baseline": [], "no_cache_thoughts": []}
             for trial in range(k_trials):
                 for label, url, use_tito in [
@@ -449,9 +507,18 @@ async def sweep_b(
                     wall = time.perf_counter() - t0
                     out[b][label].append(results)
                     n_errors = sum(1 for r in results if any(t.error for t in r.turns))
+                    trial_turns = sum(len(r.turns) for r in results)
+                    completed_turns += trial_turns
+                    completed_trials += 1
+                    elapsed = time.perf_counter() - started_at
+                    s_per_turn = elapsed / max(1, completed_turns)
+                    remaining_turns = total_turns_target - completed_turns
+                    eta = remaining_turns * s_per_turn
                     print(
-                        f"  trial={trial} {label}: B={b} convs in {wall:.1f}s "
-                        f"= {b / wall:.2f} rollouts/s  ({n_errors} errors)",
+                        f"  [{completed_trials:>3}/{total_trials}] "
+                        f"trial={trial} {label}: B={b} in {wall:.1f}s "
+                        f"= {b / wall:.2f} rollouts/s  ({n_errors} errors)   "
+                        f"[elapsed {_fmt_eta(elapsed)}  eta {_fmt_eta(eta)}]",
                         flush=True,
                     )
     return out
