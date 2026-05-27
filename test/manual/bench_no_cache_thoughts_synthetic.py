@@ -337,8 +337,11 @@ async def _stream_chat(
     body = dict(body)
     body["stream"] = True
     body["stream_options"] = {"include_usage": True}
-    body["return_prompt_token_ids"] = True
     body["return_completion_token_ids"] = True
+    # Intentionally NOT requesting return_prompt_token_ids — we derive
+    # them client-side from the tokenizer. At N=40+ the prompt is 100K+
+    # tokens, which serialized as a JSON int array exceeds aiohttp's
+    # 131KB per-SSE-line limit and tears down the response stream.
 
     content_buf = ""
     reasoning_buf = ""
@@ -416,17 +419,22 @@ async def run_conversation(
     seed_idx: int,
     n_turns: int,
     max_tokens: int,
-    use_tito: bool,
     backend_label: str,
 ) -> ConversationResult:
-    """Run one N-turn conversation, return per-turn metrics."""
+    """Run one N-turn conversation, return per-turn metrics.
+
+    Both backends always use TITO: turn 1 sends messages=, turn N+1 sends
+    input_ids= from the TITO buffer. The only difference between backends
+    is the server-side --no-cache-thoughts flag, so this is apples-to-
+    apples — both servers see identical input_ids per turn, and at
+    temperature=0 should produce byte-identical outputs.
+    """
     result = ConversationResult(backend=backend_label, seed_idx=seed_idx, n_turns=n_turns)
     initial, follow_ups = make_conversation_seed(seed_idx, n_turns)
-    messages = list(initial)
     tito: TitoSession | None = None
 
     for turn in range(1, n_turns + 1):
-        if use_tito and tito is not None:
+        if tito is not None:
             body = {
                 "model": model,
                 "messages": [{"role": "user", "content": "ignored when input_ids set"}],
@@ -435,9 +443,12 @@ async def run_conversation(
                 "max_tokens": max_tokens,
             }
         else:
+            # Turn 1: still send messages= so the server tokenizes
+            # naturally; we seed the TITO buffer from this turn's
+            # response.
             body = {
                 "model": model,
-                "messages": list(messages),
+                "messages": list(initial),
                 "temperature": 0.0,
                 "max_tokens": max_tokens,
             }
@@ -446,44 +457,40 @@ async def run_conversation(
         metrics.turn = turn
         result.turns.append(metrics)
 
-        # If this is the last turn or the request errored, stop.
         if metrics.error or turn == n_turns:
             break
 
         # Build the next user turn from the follow-ups list.
         assistant_msg = {"role": "assistant", "content": content}
-        next_user_msg = follow_ups[turn - 1]   # follow_ups[0] is for turn 1's response → goes before turn 2
-        messages.append(assistant_msg)
-        messages.append(next_user_msg)
+        next_user_msg = follow_ups[turn - 1]  # follow_ups[0] is the turn-2 user message
 
-        if use_tito:
-            if tito is None:
-                # Re-derive turn-1 prompt_token_ids client-side via the
-                # render-then-encode path (apply_chat_template with
-                # tokenize=True returns BatchEncoding on this tokenizer,
-                # not list[int]). At temperature=0 + same tokenizer, the
-                # IDs match what the server saw.
-                seed_text = tokenizer.apply_chat_template(
-                    initial, tokenize=False, add_generation_prompt=True,
-                )
-                seed_prompt_ids = list(
-                    tokenizer.encode(seed_text, add_special_tokens=False)
-                )
-                tito = TitoSession(tokenizer)
-                tito.seed(
-                    turn1_messages=initial,
-                    prompt_token_ids=seed_prompt_ids,
-                    completion_token_ids=completion_ids,
-                    reasoning_tokens=reasoning_n,
-                    assistant_message=assistant_msg,
-                )
-            else:
-                tito.append_assistant_turn(
-                    completion_token_ids=completion_ids,
-                    reasoning_tokens=reasoning_n,
-                    assistant_message=assistant_msg,
-                )
-            tito.append_user_turn(next_user_msg)
+        if tito is None:
+            # Seed from turn 1's server response. Re-derive prompt_token_ids
+            # client-side via render-then-encode (apply_chat_template with
+            # tokenize=True returns BatchEncoding on this tokenizer, not
+            # list[int]). At temperature=0 + same tokenizer, client and
+            # server IDs match.
+            seed_text = tokenizer.apply_chat_template(
+                initial, tokenize=False, add_generation_prompt=True,
+            )
+            seed_prompt_ids = list(
+                tokenizer.encode(seed_text, add_special_tokens=False)
+            )
+            tito = TitoSession(tokenizer)
+            tito.seed(
+                turn1_messages=initial,
+                prompt_token_ids=seed_prompt_ids,
+                completion_token_ids=completion_ids,
+                reasoning_tokens=reasoning_n,
+                assistant_message=assistant_msg,
+            )
+        else:
+            tito.append_assistant_turn(
+                completion_token_ids=completion_ids,
+                reasoning_tokens=reasoning_n,
+                assistant_message=assistant_msg,
+            )
+        tito.append_user_turn(next_user_msg)
 
     return result
 
@@ -551,9 +558,9 @@ async def sweep_n(
             )
             out[n] = {"baseline": [], "no_cache_thoughts": []}
             for seed in range(k_trials):
-                for label, url, use_tito in [
-                    ("baseline", bl_url, False),
-                    ("no_cache_thoughts", nct_url, True),
+                for label, url in [
+                    ("baseline", bl_url),
+                    ("no_cache_thoughts", nct_url),
                 ]:
                     conv_start = time.perf_counter()
                     print(
@@ -564,7 +571,6 @@ async def sweep_n(
                         sess, url, model, tokenizer,
                         seed_idx=seed, n_turns=n,
                         max_tokens=max_tokens,
-                        use_tito=use_tito,
                         backend_label=label,
                     )
                     conv_wall = time.perf_counter() - conv_start
@@ -624,16 +630,16 @@ async def sweep_b(
             )
             out[b] = {"baseline": [], "no_cache_thoughts": []}
             for trial in range(k_trials):
-                for label, url, use_tito in [
-                    ("baseline", bl_url, False),
-                    ("no_cache_thoughts", nct_url, True),
+                for label, url in [
+                    ("baseline", bl_url),
+                    ("no_cache_thoughts", nct_url),
                 ]:
                     t0 = time.perf_counter()
                     tasks = [
                         run_conversation(
                             sess, url, model, tokenizer,
                             seed_idx=trial * b + i, n_turns=n_turns_fixed,
-                            max_tokens=max_tokens, use_tito=use_tito,
+                            max_tokens=max_tokens,
                             backend_label=label,
                         )
                         for i in range(b)
