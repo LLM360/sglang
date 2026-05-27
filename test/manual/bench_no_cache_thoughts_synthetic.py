@@ -296,6 +296,10 @@ class TurnMetrics:
     completion_tokens: int
     reasoning_tokens: int
     error: str | None = None
+    # Truncated previews of the generation so we can diagnose
+    # length / quality divergence between backends post-hoc.
+    content_preview: str = ""
+    reasoning_preview: str = ""
 
     @property
     def decode_s(self) -> float | None:
@@ -332,8 +336,10 @@ async def _stream_chat(
     url: str,
     body: dict,
     timeout_s: float = 300.0,
-) -> tuple[TurnMetrics, str, list[int], int]:
-    """POST stream=true, parse SSE, return (TurnMetrics, content, completion_token_ids, reasoning_tokens)."""
+) -> tuple[TurnMetrics, str, str, list[int], int]:
+    """POST stream=true, parse SSE.
+
+    Returns (TurnMetrics, content, reasoning_content, completion_token_ids, reasoning_tokens)."""
     body = dict(body)
     body["stream"] = True
     body["stream_options"] = {"include_usage": True}
@@ -407,8 +413,12 @@ async def _stream_chat(
         completion_tokens=len(completion_token_ids),
         reasoning_tokens=reasoning_tokens,
         error=error,
+        # Keep first 400 chars of each — enough to spot length divergence
+        # and detect OOD garbled output without ballooning the JSON.
+        content_preview=content_buf[:400],
+        reasoning_preview=reasoning_buf[:400],
     )
-    return metrics, content_buf, completion_token_ids, reasoning_tokens
+    return metrics, content_buf, reasoning_buf, completion_token_ids, reasoning_tokens
 
 
 async def run_conversation(
@@ -420,21 +430,30 @@ async def run_conversation(
     n_turns: int,
     max_tokens: int,
     backend_label: str,
+    mode: str,
 ) -> ConversationResult:
     """Run one N-turn conversation, return per-turn metrics.
 
-    Both backends always use TITO: turn 1 sends messages=, turn N+1 sends
-    input_ids= from the TITO buffer. The only difference between backends
-    is the server-side --no-cache-thoughts flag, so this is apples-to-
-    apples — both servers see identical input_ids per turn, and at
-    temperature=0 should produce byte-identical outputs.
+    mode controls the client protocol:
+      * "realistic": send messages= every turn; keep reasoning_content in
+        the assistant message so the chat template re-renders thoughts
+        back into history. Models the production case where no TITO is
+        used. (Case 1 from the README.)
+      * "tito": send messages= on turn 1, input_ids= on subsequent turns
+        from a TitoSession buffer (thoughts stripped). Models the case
+        where the client adopts TITO. (Case 3 from the README.)
+
+    The server-side --no-cache-thoughts flag is independent of mode and
+    is set by which url you pass.
     """
+    assert mode in ("realistic", "tito"), f"unknown mode: {mode}"
     result = ConversationResult(backend=backend_label, seed_idx=seed_idx, n_turns=n_turns)
     initial, follow_ups = make_conversation_seed(seed_idx, n_turns)
     tito: TitoSession | None = None
+    messages_for_realistic: list[dict] = list(initial)
 
     for turn in range(1, n_turns + 1):
-        if tito is not None:
+        if mode == "tito" and tito is not None:
             body = {
                 "model": model,
                 "messages": [{"role": "user", "content": "ignored when input_ids set"}],
@@ -442,10 +461,17 @@ async def run_conversation(
                 "temperature": 0.0,
                 "max_tokens": max_tokens,
             }
+        elif mode == "realistic":
+            body = {
+                "model": model,
+                "messages": list(messages_for_realistic),
+                "temperature": 0.0,
+                "max_tokens": max_tokens,
+            }
         else:
-            # Turn 1: still send messages= so the server tokenizes
-            # naturally; we seed the TITO buffer from this turn's
-            # response.
+            # tito mode, turn 1 — still send messages= so the server
+            # tokenizes naturally; we seed the TITO buffer from the
+            # response and use input_ids= for turn 2+.
             body = {
                 "model": model,
                 "messages": list(initial),
@@ -453,44 +479,50 @@ async def run_conversation(
                 "max_tokens": max_tokens,
             }
 
-        metrics, content, completion_ids, reasoning_n = await _stream_chat(session, url, body)
+        metrics, content, reasoning, completion_ids, reasoning_n = await _stream_chat(
+            session, url, body
+        )
         metrics.turn = turn
         result.turns.append(metrics)
 
         if metrics.error or turn == n_turns:
             break
 
-        # Build the next user turn from the follow-ups list.
-        assistant_msg = {"role": "assistant", "content": content}
-        next_user_msg = follow_ups[turn - 1]  # follow_ups[0] is the turn-2 user message
+        assistant_msg: dict = {"role": "assistant", "content": content}
+        if reasoning:
+            # Keep reasoning_content so the chat template (in realistic
+            # mode) can re-render <think>...</think> on subsequent turns.
+            # In tito mode this field exists but is irrelevant — the
+            # input_ids buffer is the source of truth.
+            assistant_msg["reasoning_content"] = reasoning
+        next_user_msg = follow_ups[turn - 1]
 
-        if tito is None:
-            # Seed from turn 1's server response. Re-derive prompt_token_ids
-            # client-side via render-then-encode (apply_chat_template with
-            # tokenize=True returns BatchEncoding on this tokenizer, not
-            # list[int]). At temperature=0 + same tokenizer, client and
-            # server IDs match.
-            seed_text = tokenizer.apply_chat_template(
-                initial, tokenize=False, add_generation_prompt=True,
-            )
-            seed_prompt_ids = list(
-                tokenizer.encode(seed_text, add_special_tokens=False)
-            )
-            tito = TitoSession(tokenizer)
-            tito.seed(
-                turn1_messages=initial,
-                prompt_token_ids=seed_prompt_ids,
-                completion_token_ids=completion_ids,
-                reasoning_tokens=reasoning_n,
-                assistant_message=assistant_msg,
-            )
-        else:
-            tito.append_assistant_turn(
-                completion_token_ids=completion_ids,
-                reasoning_tokens=reasoning_n,
-                assistant_message=assistant_msg,
-            )
-        tito.append_user_turn(next_user_msg)
+        if mode == "realistic":
+            messages_for_realistic.append(assistant_msg)
+            messages_for_realistic.append(next_user_msg)
+        else:  # tito
+            if tito is None:
+                seed_text = tokenizer.apply_chat_template(
+                    initial, tokenize=False, add_generation_prompt=True,
+                )
+                seed_prompt_ids = list(
+                    tokenizer.encode(seed_text, add_special_tokens=False)
+                )
+                tito = TitoSession(tokenizer)
+                tito.seed(
+                    turn1_messages=initial,
+                    prompt_token_ids=seed_prompt_ids,
+                    completion_token_ids=completion_ids,
+                    reasoning_tokens=reasoning_n,
+                    assistant_message=assistant_msg,
+                )
+            else:
+                tito.append_assistant_turn(
+                    completion_token_ids=completion_ids,
+                    reasoning_tokens=reasoning_n,
+                    assistant_message=assistant_msg,
+                )
+            tito.append_user_turn(next_user_msg)
 
     return result
 
@@ -536,16 +568,21 @@ async def sweep_n(
     """N-sweep at batch=1: for each N value, run K trials per backend
     sequentially. Returns nested dict[n_value][backend] -> list[ConversationResult].
 
-    Progress tracking: total work is sum(n) * K * 2 (since each turn takes
-    ~constant time, total turns is a better unit than total conversations).
-    After each conversation we update the running mean of seconds-per-turn
-    and project the remaining turns.
+    Three backend conditions per (N, seed):
+      * realistic       (flag OFF, messages= with reasoning_content kept) — case 1
+      * tito_baseline   (flag OFF, input_ids= with thoughts stripped)     — case 3, no flag
+      * tito_nct        (flag ON,  input_ids= with thoughts stripped)     — case 3, with flag
     """
+    BACKENDS = [
+        ("realistic", bl_url, "realistic"),
+        ("tito_baseline", bl_url, "tito"),
+        ("tito_nct", nct_url, "tito"),
+    ]
     out: dict[int, dict[str, list[ConversationResult]]] = {}
-    total_turns_target = sum(n_values) * k_trials * 2  # × 2 backends
+    total_turns_target = sum(n_values) * k_trials * len(BACKENDS)
     completed_turns = 0
     completed_convs = 0
-    total_convs = len(n_values) * k_trials * 2
+    total_convs = len(n_values) * k_trials * len(BACKENDS)
     started_at = time.perf_counter()
 
     async with aiohttp.ClientSession() as sess:
@@ -556,12 +593,9 @@ async def sweep_n(
                 f"(condition {n_idx}/{len(n_values)})",
                 flush=True,
             )
-            out[n] = {"baseline": [], "no_cache_thoughts": []}
+            out[n] = {label: [] for label, _, _ in BACKENDS}
             for seed in range(k_trials):
-                for label, url in [
-                    ("baseline", bl_url),
-                    ("no_cache_thoughts", nct_url),
-                ]:
+                for label, url, mode in BACKENDS:
                     conv_start = time.perf_counter()
                     print(
                         f"  [{completed_convs + 1:>3}/{total_convs}] "
@@ -572,6 +606,7 @@ async def sweep_n(
                         seed_idx=seed, n_turns=n,
                         max_tokens=max_tokens,
                         backend_label=label,
+                        mode=mode,
                     )
                     conv_wall = time.perf_counter() - conv_start
                     out[n][label].append(r)
@@ -617,6 +652,11 @@ async def sweep_b(
     completed_trials = 0
     started_at = time.perf_counter()
 
+    BACKENDS = [
+        ("realistic", bl_url, "realistic"),
+        ("tito_baseline", bl_url, "tito"),
+        ("tito_nct", nct_url, "tito"),
+    ]
     async with aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(limit=512),
     ) as sess:
@@ -628,12 +668,9 @@ async def sweep_b(
                 f"— each trial = {b} concurrent {n_turns_fixed}-turn convs",
                 flush=True,
             )
-            out[b] = {"baseline": [], "no_cache_thoughts": []}
+            out[b] = {label: [] for label, _, _ in BACKENDS}
             for trial in range(k_trials):
-                for label, url in [
-                    ("baseline", bl_url),
-                    ("no_cache_thoughts", nct_url),
-                ]:
+                for label, url, mode in BACKENDS:
                     t0 = time.perf_counter()
                     tasks = [
                         run_conversation(
@@ -641,6 +678,7 @@ async def sweep_b(
                             seed_idx=trial * b + i, n_turns=n_turns_fixed,
                             max_tokens=max_tokens,
                             backend_label=label,
+                            mode=mode,
                         )
                         for i in range(b)
                     ]
@@ -673,19 +711,23 @@ def fmt_ms(s: float | None) -> str:
 
 
 def print_n_sweep_tables(n_sweep: dict, n_values: list[int]) -> None:
-    print("\n" + "=" * 100)
+    LABELS = ["realistic", "tito_baseline", "tito_nct"]
+    print("\n" + "=" * 110)
     print("N-sweep — per-turn metrics, B=1, mean ± stddev across K seeds")
-    print("=" * 100)
+    print("  realistic     = chat-template (messages=) + reasoning_content kept, flag OFF — case 1")
+    print("  tito_baseline = TITO (input_ids=, thoughts stripped), flag OFF              — case 3, no flag")
+    print("  tito_nct      = TITO (input_ids=, thoughts stripped), flag ON               — case 3, flag")
+    print("=" * 110)
     for n in n_values:
-        bl_runs = n_sweep[n]["baseline"]
-        nct_runs = n_sweep[n]["no_cache_thoughts"]
-        if not bl_runs or not nct_runs:
+        runs_by_label = {l: n_sweep[n].get(l, []) for l in LABELS}
+        if not all(runs_by_label[l] for l in LABELS):
             continue
         print(f"\n  N={n}")
-        print(f"  {'turn':>4}  {'backend':<22} {'TTFT ms':>10} {'step ms':>10} "
+        print(f"  {'turn':>4}  {'backend':<16} {'TTFT ms':>10} {'step ms':>10} "
               f"{'decode ms':>10} {'uncached pfx':>13}  {'CI95(TTFT)':>11}")
         for turn in range(1, n + 1):
-            for label, runs in [("baseline", bl_runs), ("no_cache_thoughts", nct_runs)]:
+            for label in LABELS:
+                runs = runs_by_label[label]
                 ttfts_ms = [r.turns[turn - 1].ttft_s * 1000
                             for r in runs if len(r.turns) >= turn
                             and r.turns[turn - 1].ttft_s is not None]
@@ -696,57 +738,71 @@ def print_n_sweep_tables(n_sweep: dict, n_values: list[int]) -> None:
                               and r.turns[turn - 1].decode_s is not None]
                 uncached = [r.turns[turn - 1].uncached_prefill
                             for r in runs if len(r.turns) >= turn]
-                ttft_m, ttft_s = mean_std(ttfts_ms)
+                ttft_m, ttft_s_dev = mean_std(ttfts_ms)
                 step_m, step_s_dev = mean_std(steps_ms)
                 dec_m, _ = mean_std(decodes_ms)
                 unc_m = statistics.mean(uncached) if uncached else 0
                 print(
-                    f"  {turn:>4}  {label:<22} {ttft_m:>7.1f}±{ttft_s:<2.0f} "
+                    f"  {turn:>4}  {label:<16} {ttft_m:>7.1f}±{ttft_s_dev:<2.0f} "
                     f"{step_m:>7.1f}±{step_s_dev:<2.0f} {dec_m:>9.1f}  "
                     f"{unc_m:>13.0f}  {ci95(ttfts_ms):>10.1f}"
                 )
 
-    print("\n" + "-" * 100)
+    print("\n" + "-" * 110)
     print("N-sweep — conversation totals (sum across N turns), mean across K seeds")
-    print("-" * 100)
-    print(f"  {'N':>3}  {'metric':<30}  {'baseline':>13}  {'NCT':>13}  "
-          f"{'delta':>10}  {'speedup':>9}")
+    print("-" * 110)
+    print(f"  {'N':>3}  {'metric':<30}  {'realistic':>11}  {'tito_baseline':>14}  "
+          f"{'tito_nct':>11}")
     for n in n_values:
-        bl_runs = n_sweep[n]["baseline"]
-        nct_runs = n_sweep[n]["no_cache_thoughts"]
-        if not bl_runs or not nct_runs:
+        runs_by_label = {l: n_sweep[n].get(l, []) for l in LABELS}
+        if not all(runs_by_label[l] for l in LABELS):
             continue
-        bl_totals = [r.total_step_s for r in bl_runs]
-        nct_totals = [r.total_step_s for r in nct_runs]
-        bl_pf = [r.cumulative_uncached_prefill for r in bl_runs]
-        nct_pf = [r.cumulative_uncached_prefill for r in nct_runs]
-        bl_t, _ = mean_std(bl_totals)
-        nct_t, _ = mean_std(nct_totals)
-        bl_p, _ = mean_std([float(x) for x in bl_pf])
-        nct_p, _ = mean_std([float(x) for x in nct_pf])
-        speedup = bl_t / nct_t if nct_t else float("inf")
-        print(f"  {n:>3}  {'conversation latency (s)':<30}  {bl_t:>13.2f}  "
-              f"{nct_t:>13.2f}  {(nct_t - bl_t):>+9.2f}s  {speedup:>8.2f}x")
-        print(f"  {' ':>3}  {'cumulative uncached prefill':<30}  {bl_p:>13.0f}  "
-              f"{nct_p:>13.0f}  {(nct_p - bl_p):>+10.0f}  {bl_p / nct_p if nct_p else 0:>8.2f}x")
+        means = {}
+        pf_means = {}
+        for l in LABELS:
+            totals = [r.total_step_s for r in runs_by_label[l]]
+            pf = [float(r.cumulative_uncached_prefill) for r in runs_by_label[l]]
+            means[l], _ = mean_std(totals)
+            pf_means[l], _ = mean_std(pf)
+        print(f"  {n:>3}  {'conversation latency (s)':<30}  "
+              f"{means['realistic']:>10.2f}s  {means['tito_baseline']:>13.2f}s  "
+              f"{means['tito_nct']:>10.2f}s")
+        print(f"  {' ':>3}  {'cumulative uncached prefill':<30}  "
+              f"{pf_means['realistic']:>11.0f}  {pf_means['tito_baseline']:>14.0f}  "
+              f"{pf_means['tito_nct']:>11.0f}")
 
-    # Significance crossover
-    print("\n" + "-" * 100)
-    print("Per-turn TTFT significance: smallest turn where (baseline − NCT) ≥ 2σ")
-    print("-" * 100)
+    print("\n" + "-" * 110)
+    print("Per-query speedup vs realistic baseline  (conversation latency ratio)")
+    print("-" * 110)
+    print(f"  {'N':>3}  {'tito_baseline':>16}  {'tito_nct':>14}")
     for n in n_values:
-        bl_runs = n_sweep[n]["baseline"]
-        nct_runs = n_sweep[n]["no_cache_thoughts"]
+        runs_by_label = {l: n_sweep[n].get(l, []) for l in LABELS}
+        if not all(runs_by_label[l] for l in LABELS):
+            continue
+        r_t, _ = mean_std([r.total_step_s for r in runs_by_label["realistic"]])
+        b_t, _ = mean_std([r.total_step_s for r in runs_by_label["tito_baseline"]])
+        n_t, _ = mean_std([r.total_step_s for r in runs_by_label["tito_nct"]])
+        bl_sp = r_t / b_t if b_t else float("inf")
+        nct_sp = r_t / n_t if n_t else float("inf")
+        print(f"  {n:>3}  {bl_sp:>15.2f}x  {nct_sp:>13.2f}x")
+
+    print("\n" + "-" * 110)
+    print("Per-turn TTFT significance: smallest turn where (realistic − tito_nct) ≥ 2σ")
+    print("-" * 110)
+    for n in n_values:
+        runs_by_label = {l: n_sweep[n].get(l, []) for l in LABELS}
+        if not all(runs_by_label[l] for l in LABELS):
+            continue
         crossover_turn = None
         for turn in range(1, n + 1):
-            bl_ttfts = [r.turns[turn - 1].ttft_s for r in bl_runs
-                        if len(r.turns) >= turn and r.turns[turn - 1].ttft_s is not None]
-            nct_ttfts = [r.turns[turn - 1].ttft_s for r in nct_runs
-                         if len(r.turns) >= turn and r.turns[turn - 1].ttft_s is not None]
-            if len(bl_ttfts) < 2 or len(nct_ttfts) < 2:
+            r_ttfts = [r.turns[turn - 1].ttft_s for r in runs_by_label["realistic"]
+                       if len(r.turns) >= turn and r.turns[turn - 1].ttft_s is not None]
+            n_ttfts = [r.turns[turn - 1].ttft_s for r in runs_by_label["tito_nct"]
+                       if len(r.turns) >= turn and r.turns[turn - 1].ttft_s is not None]
+            if len(r_ttfts) < 2 or len(n_ttfts) < 2:
                 continue
-            delta = statistics.mean(bl_ttfts) - statistics.mean(nct_ttfts)
-            pooled_sd = ((statistics.variance(bl_ttfts) + statistics.variance(nct_ttfts)) / 2) ** 0.5
+            delta = statistics.mean(r_ttfts) - statistics.mean(n_ttfts)
+            pooled_sd = ((statistics.variance(r_ttfts) + statistics.variance(n_ttfts)) / 2) ** 0.5
             if delta >= 2 * pooled_sd:
                 crossover_turn = turn
                 break
@@ -866,7 +922,9 @@ def main() -> None:
                     {"turn": t.turn, "ttft_s": t.ttft_s, "step_s": t.step_s,
                      "prompt_tokens": t.prompt_tokens, "cached_tokens": t.cached_tokens,
                      "completion_tokens": t.completion_tokens,
-                     "reasoning_tokens": t.reasoning_tokens, "error": t.error}
+                     "reasoning_tokens": t.reasoning_tokens, "error": t.error,
+                     "content_preview": t.content_preview,
+                     "reasoning_preview": t.reasoning_preview}
                     for t in r.turns
                 ],
             }
