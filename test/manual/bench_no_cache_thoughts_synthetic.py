@@ -114,45 +114,170 @@ class TitoSession:
 # get statistical independence from varying SEED topics, not from
 # stochastic sampling.
 
-SEED_TOPICS = [
-    "Explain the transformer architecture used in large language models, focusing on multi-head attention.",
-    "Describe the history and key milestones in the development of CRISPR-Cas9 gene editing.",
-    "Outline the principles behind distributed consensus protocols like Raft and Paxos.",
-    "Walk through how a modern compiler converts source code to machine instructions.",
-    "Explain the macroeconomic causes and consequences of the 2008 financial crisis.",
-    "Describe how convolutional neural networks process images at each layer.",
-    "Outline the major schools of thought in 20th century continental philosophy.",
-    "Explain how kidney dialysis works, both hemodialysis and peritoneal.",
-    "Walk through the lifecycle of a request in a typical web application.",
-    "Describe the cellular mechanisms of muscle contraction at the sarcomere level.",
-    "Outline the architecture and trade-offs of the Raft consensus protocol.",
-    "Explain quantum entanglement and its implications for cryptography.",
-    "Describe how plate tectonics drives earthquakes and volcanism.",
-    "Walk through the steps of protein synthesis from DNA to functional protein.",
-    "Outline the major causes and effects of climate change on ocean ecosystems.",
-    "Explain the design principles behind modern container orchestration systems.",
-    "Describe the differences between Bayesian and frequentist statistical inference.",
-    "Walk through the historical development of public-key cryptography.",
-    "Outline the architecture of a modern CPU including pipeline and cache hierarchy.",
-    "Explain how the human visual system processes color and depth perception.",
-]
+# Realistic agentic conversation sizing
+# --------------------------------------
+# Real RL rollouts (search-agent, code-agent, etc.) have:
+#   * Long system prompts: tool schemas + instructions, ~2K tokens
+#   * Substantial "tool result" content per turn: scraped pages, search
+#     results, retrieved chunks — typically 2-5K tokens
+#   * Per turn the conversation grows by ~3-5K tokens
+# The earlier ~500-token defaults didn't exercise the prefill regime
+# where cache savings dominate. These constants target ~3-4K growth/turn
+# so by N=50 the cumulative prompt is ~150-200K tokens (within the
+# 524K context window of k2v3-7b but well past the small-prompt regime).
 
-FOLLOW_UPS = [
-    "Now expand on the most important claim you just made with specific details.",
-    "Critique the previous answer from three different perspectives.",
-    "List five concrete examples that illustrate what you just explained.",
-    "Identify three potential limitations or counterarguments to the previous answer.",
-    "Now reframe the previous answer for a different audience: a curious teenager.",
-    "Compare and contrast your previous answer with an alternative viewpoint.",
-]
+SYSTEM_PROMPT = """You are a deep research agent operating in a high-stakes investigation. Your task is to analyze evidence, reconcile sources, and produce thorough, well-cited answers.
+
+PROTOCOL — STRICT ADHERENCE REQUIRED
+You are equipped with the following capabilities, applied in an interleaved manner:
+  1. web_search(query: str, num_results: int = 10) -> list of {title, link, snippet}
+       Searches Google via Serper. Returns the top organic results plus an
+       optional answer box and knowledge graph entry. Snippets are short.
+  2. read_url(url: str) -> string
+       Fetches a web page as clean markdown via Jina Reader. Long pages are
+       truncated to 8000 characters. Use this to verify facts found via search.
+  3. cross_reference(claim: str, sources: list[str]) -> {verdict, agreements, disagreements}
+       Internal reconciliation tool — compares a claim across given sources
+       and surfaces verbatim agreements and contradictions.
+
+For EVERY substantive claim in your final answer you MUST cite:
+  - The exact source URL
+  - A verbatim quoted sentence from that source supporting the claim
+  - The confidence interval based on how many independent sources corroborate
+
+OUTPUT FORMAT — your final answer MUST contain three sections:
+  Explanation: (your reasoning across the evidence, 3-5 paragraphs)
+  Exact Answer: (your succinct final answer in 1-2 sentences)
+  Confidence: (numeric score 0-100% plus a one-paragraph justification)
+
+DO NOT emit a final answer until you have:
+  - Performed at least 8 distinct tool calls
+  - Read at least 3 different URLs in full
+  - Verified each substantive claim against 2+ independent sources
+  - Surfaced any disagreements between sources explicitly
+
+ERROR HANDLING: if a read_url returns an error (paywall, 451, timeout),
+substitute by searching for a primary-source equivalent and read THAT
+instead. Never fall back to your training-data priors as a substitute
+for a failed fetch — they are not citable.
+
+You may use any combination of these capabilities, but you MUST keep each
+reasoning step focused. After each tool call, summarize what you learned
+and what gap remains. Do not pad your reasoning with restated context."""
+
+# A realistic "tool result" — a chunk of public-domain text (~3K tokens
+# of repeatable content). Using a stable string so token IDs are
+# deterministic across runs. Each follow-up turn appends a different
+# offset into this corpus so successive turns add new content (the
+# cache hit on prior turns reflects real reuse).
+_TOOL_RESULT_CORPUS = (
+    "Federalist No. 10, written by James Madison and published on November 22, 1787, "
+    "remains one of the most consequential essays in American political theory. Madison's "
+    "principal concern was the threat that factions posed to a constitutional republic. "
+    "He defined a faction as a number of citizens, whether amounting to a majority or "
+    "minority of the whole, united by some common impulse of passion or interest adverse "
+    "to the rights of other citizens or to the permanent and aggregate interests of the "
+    "community. Madison conceded that the latent causes of faction are sown in the nature "
+    "of man — that as long as people retain freedom of thought and unequal faculties "
+    "for acquiring property, parties and factions will inevitably form. The question, "
+    "therefore, was not how to suppress factions but how to control their effects. " * 6
+    +
+    "Madison rejected the option of removing the causes of faction. Eliminating liberty "
+    "would cure the disease, but liberty was the very thing the new constitution was "
+    "designed to secure. Forcing every citizen to have the same opinions, passions, and "
+    "interests was impracticable. The only remaining course was to control the effects. "
+    "Here Madison drew his crucial distinction between a pure democracy and a republic. "
+    "In a pure democracy, where citizens administer government in person, a majority "
+    "faction could readily oppress the minority — there was nothing in the structure to "
+    "check passions. A republic, by contrast, delegated government to a small number of "
+    "representatives chosen by the rest. This refinement of public views, Madison argued, "
+    "filtered popular passions through the medium of a chosen body of citizens whose "
+    "wisdom might best discern the true interest of the country. " * 6
+    +
+    "The second advantage Madison identified was the greater number of citizens and "
+    "extent of territory which could be brought within the compass of republican as opposed "
+    "to democratic government. The larger the society, the greater the variety of parties "
+    "and interests, and the less probable that a majority of the whole would invade the "
+    "rights of others. Even if such a common motive existed, communication and "
+    "coordination across great distances would render it harder to act in concert. This "
+    "argument inverted the classical assumption that small republics were inherently more "
+    "stable than large ones. Montesquieu and others had argued that republican government "
+    "required a small territory and a homogeneous citizenry to survive. Madison turned the "
+    "argument inside out: it was precisely the LARGE size of the proposed federal republic, "
+    "and the diversity of interests it would contain, that would protect liberty. " * 6
+)
+
+
+def _seed_topic_question(seed_idx: int) -> str:
+    """A specific research question to be appended after the long system prompt
+    and the seed corpus chunk. Varies by seed_idx for trial independence."""
+    topics = [
+        "transformer architecture's role in scaling laws for language models",
+        "CRISPR-Cas9's off-target effects in therapeutic applications",
+        "Raft consensus protocol's behavior under network partitions",
+        "modern compiler optimization passes targeting SIMD instructions",
+        "the 2008 financial crisis's effect on shadow banking regulation",
+        "convolutional neural networks' equivariance properties",
+        "20th century continental philosophy's response to phenomenology",
+        "kidney dialysis's long-term effects on cardiovascular health",
+        "modern web application request lifecycle under sustained load",
+        "muscle contraction's calcium signaling at the sarcomere level",
+        "Raft vs Paxos trade-offs in leader election latency",
+        "quantum entanglement-based cryptographic protocols' security proofs",
+        "plate tectonics' role in driving deep-ocean volcanic vents",
+        "protein synthesis's regulation by ribosomal stalling",
+        "climate change's effect on oceanic carbon sequestration capacity",
+        "container orchestration's scheduling fairness guarantees",
+        "Bayesian vs frequentist inference in high-dimensional regression",
+        "public-key cryptography's post-quantum migration timeline",
+        "modern CPU's branch prediction and speculative execution attacks",
+        "human color vision's neural coding at the retinal level",
+    ]
+    topic = topics[seed_idx % len(topics)]
+    return (
+        f"Using the protocol above and the evidence excerpts I will provide in "
+        f"subsequent turns, investigate: '{topic}'. Begin by outlining what evidence "
+        f"you would need to gather and what aspects of the topic are most contested. "
+        f"Wait for additional source material before forming conclusions."
+    )
+
+
+def _follow_up_text(turn_idx: int, seed_idx: int) -> str:
+    """A realistic per-turn follow-up: includes a chunk of 'tool result'
+    content (~3K tokens) plus an instruction. Different chunks per turn so
+    successive turns add genuinely new prefill content."""
+    chunk_size = 3000
+    # Rotate the corpus offset by (turn + seed) so different conversations get
+    # different sequences but the same conversation is deterministic.
+    offset = ((turn_idx * 1009 + seed_idx * 311) % len(_TOOL_RESULT_CORPUS))
+    chunk = (_TOOL_RESULT_CORPUS + _TOOL_RESULT_CORPUS)[offset : offset + chunk_size]
+    return (
+        f"<tool_result name=\"read_url\" url=\"https://example.org/source-{turn_idx}-{seed_idx}.html\">\n"
+        f"{chunk}\n"
+        f"</tool_result>\n\n"
+        f"Incorporate this evidence into your analysis. Identify any claims it "
+        f"supports or contradicts from your prior reasoning. Then decide what to "
+        f"investigate next."
+    )
 
 
 def make_conversation_seed(seed_idx: int, n_turns: int) -> tuple[list[dict], list[dict]]:
-    """Return (initial_user_messages, follow_up_messages) where the initial
-    is the first user turn and follow_ups are the subsequent user turns."""
-    initial = [{"role": "user", "content": SEED_TOPICS[seed_idx % len(SEED_TOPICS)]}]
+    """Return (initial_user_messages, follow_up_messages).
+
+    Initial = [system, user(seed question with corpus excerpt)]. System
+    prompt is ~2K tokens; user message adds another ~3K. Initial prompt
+    total ≈ 5K tokens.
+
+    Follow-ups = subsequent user turns, each ~3K tokens of "tool result"
+    content + a short instruction. After N turns the conversation has
+    ~5K + 3K × (N-1) ≈ 3K × N tokens of prefill.
+    """
+    initial = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": _seed_topic_question(seed_idx)},
+    ]
     follow_ups = [
-        {"role": "user", "content": FOLLOW_UPS[(t - 1) % len(FOLLOW_UPS)]}
+        {"role": "user", "content": _follow_up_text(turn_idx=t, seed_idx=seed_idx)}
         for t in range(1, n_turns)
     ]
     return initial, follow_ups
