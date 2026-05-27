@@ -44,6 +44,30 @@ class TestK2V3DetectorTokenSelection(CustomTestCase):
             K2V3Detector(force_reasoning=False)
 
 
+class TestK2V3DetectorToolCallSplit(CustomTestCase):
+    """K2-v3 exits reasoning mode when <tool_call> appears without </think>."""
+
+    def test_tool_call_split_detect_and_parse(self):
+        detector = K2V3Detector(reasoning_effort="high")
+        text = "I'll check the file.\n<tool_call>\n{\"name\": \"read\", \"arguments\": {\"filePath\": \"/tmp/f\"}}\n</tool_call>"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "I'll check the file.\n")
+        self.assertTrue(result.normal_text.startswith("<tool_call>"))
+
+    def test_tool_call_split_streaming(self):
+        detector = K2V3Detector(reasoning_effort="high")
+        r1 = detector.parse_streaming_increment("I'll check the file.\n")
+        self.assertEqual(r1.reasoning_text, "I'll check the file.\n")
+        self.assertEqual(r1.normal_text, "")
+        r2 = detector.parse_streaming_increment("<tool_call>\n{\"name\": \"read\"}\n</tool_call>")
+        self.assertEqual(r2.normal_text, "<tool_call>\n{\"name\": \"read\"}\n</tool_call>")
+        self.assertEqual(r2.reasoning_text, "")
+
+    def test_tool_call_start_token_is_set(self):
+        detector = K2V3Detector()
+        self.assertEqual(detector.tool_start_token, "<tool_call>")
+
+
 class TestK2V3DetectorParsing(CustomTestCase):
     """K2-v3 inherits the standard <think>...</think> state machine."""
 
