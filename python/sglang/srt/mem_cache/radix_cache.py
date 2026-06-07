@@ -495,12 +495,11 @@ class RadixCache(BasePrefixCache):
             is_insert: when False, free the request's kv_indices without inserting them
                 into the radix tree (e.g. abort / retract paths).
             split: when provided (a NoCacheThoughtsSplit from
-                ``sglang.srt.mem_cache.common.split_kv_for_no_cache_thoughts``), use the
-                split's virtual token ids / kv_indices / positions for the radix insert
-                instead of looking them up from the per-request KV slot. The thought
-                slice in ``split.thought_kv_indices_to_free`` is freed immediately. This
-                allows skipping thought tokens while preserving original RoPE positions
-                on the cached answer slice.
+                ``sglang.srt.mem_cache.common.split_kv_for_no_cache_thoughts``), cache the
+                thought-stripped sequence: relocate the answer's KV into page-congruent
+                slots (``split.move_dst`` <- ``split.move_src``), insert the answer with
+                its original RoPE positions preserved, then free the page-aligned dead
+                tail (stale thoughts + unaligned answer remainder).
         """
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
@@ -509,14 +508,24 @@ class RadixCache(BasePrefixCache):
         kv_committed_len = req.pop_committed_kv_cache()
 
         if split is not None:
-            # Skip the per-req KV-pool lookup; use the pre-computed virtual slice.
+            # Skip the per-req KV-pool lookup; use the pre-computed plan.
+            # split.virtual_kv_indices is the request's FULL original slot span, so a
+            # single free here returns everything when we are not inserting.
             if self.disable or not is_insert:
                 self.token_to_kv_pool_allocator.free(split.virtual_kv_indices)
-                self.token_to_kv_pool_allocator.free(split.thought_kv_indices_to_free)
                 self.dec_lock_ref(req.last_node)
                 return
-            # Free the thought slice; it never enters the shared cache.
-            self.token_to_kv_pool_allocator.free(split.thought_kv_indices_to_free)
+            # Relocate the answer's KV left into the slots the thoughts are vacating, so
+            # each cached answer token sits in a slot page-congruent to its NEW index in
+            # the thought-stripped sequence. Paged KV requires slot % page == index %
+            # page; without this the answer is unreachable for safe extension and trips
+            # the allocator's page-alignment assert. The move reads its source fully
+            # before writing (overlap-safe); the vacated thought slots are reclaimed below
+            # as part of the page-aligned dead tail.
+            if split.move_src.numel() > 0:
+                self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                    split.move_dst, split.move_src
+                )
             keys = (
                 convert_to_bigram_key(split.virtual_token_ids)
                 if self.is_eagle
@@ -543,7 +552,8 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(
                 split.virtual_kv_indices[req.cache_protected_len : new_prefix_len]
             )
-            # Free any unaligned tail from the page_align trim.
+            # One page-aligned cut frees the dead tail: the stale thought slots plus the
+            # answer's page-unaligned remainder. Single free() -> no boundary double-free.
             self.token_to_kv_pool_allocator.free(split.virtual_kv_indices[len(keys) :])
             self.dec_lock_ref(req.last_node)
             return

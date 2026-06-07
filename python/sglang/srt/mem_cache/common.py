@@ -96,18 +96,33 @@ def derive_extend_position_start(
 
 @dataclasses.dataclass
 class NoCacheThoughtsSplit:
-    """Result of splitting a finished reasoning request's KV into the radix-bound slice
-    and the freed-only thought slice.
+    """Plan for caching a finished reasoning request without its thought span.
 
-    The cache_finished_req path consumes virtual_token_ids/positions/kv_indices to
-    register the answer in the radix tree with its original positions preserved,
-    then frees thought_kv_indices_to_free directly to the allocator.
+    Dropping the generated <think>...</think> tokens shifts every answer token's index
+    in the cached sequence DOWN by len(thoughts), but its KV still physically sits in
+    the slot decode gave it. Paged KV requires slot % page_size == index % page_size,
+    so the answer's KV must be RELOCATED into the slots the thoughts are vacating (which
+    are page-congruent to the answer's new indices) before it can be cached and safely
+    extended later. cache_finished_req consumes this plan as:
+      1. move_kv_cache(move_dst, move_src)  -> slide the answer's KV left
+      2. insert virtual_token_ids/positions, values from virtual_kv_indices[:aligned]
+      3. free virtual_kv_indices[aligned:]  -> one page-aligned cut for the dead tail
     """
 
+    # input + post-</think> answer (thoughts removed); the cached key sequence.
     virtual_token_ids: List[int]
+    # The request's FULL original contiguous slot span S[0:total_len]. After the move,
+    # S[0:kept_len] holds input+answer and S[kept_len:] is the dead tail (stale thought
+    # slots + the answer's page-unaligned remainder), freed in one page-aligned cut.
     virtual_kv_indices: torch.Tensor
+    # Original RoPE positions of the kept tokens (gapped where thoughts were); the K
+    # vectors already encode these, so positions are preserved while only slots move.
     virtual_positions: torch.Tensor
-    thought_kv_indices_to_free: torch.Tensor
+    # Relocation: move the answer's current slots (move_src = S[answer_start:total_len])
+    # into the page-congruent destination (move_dst = S[input_len:kept_len]). Empty when
+    # there is no thought span or no answer (nothing to relocate).
+    move_src: torch.Tensor
+    move_dst: torch.Tensor
 
 
 def split_kv_for_no_cache_thoughts(
@@ -115,6 +130,7 @@ def split_kv_for_no_cache_thoughts(
     output_ids: List[int],
     req_to_token_slot: torch.Tensor,
     answer_start_position: int,
+    committed_len: int,
 ) -> NoCacheThoughtsSplit:
     """Compute the split-insertion tensors for a finished reasoning request.
 
@@ -127,68 +143,86 @@ def split_kv_for_no_cache_thoughts(
         origin_input_ids: input token ids (positions 0..len(input)-1).
         output_ids: generated token ids (positions len(input)..len(input)+len(output)-1).
         req_to_token_slot: 1D tensor of kv_indices, one per token in the request's
-            sequence (length must be >= len(origin_input_ids) + len(output_ids)).
+            sequence (length must be >= committed_len).
         answer_start_position: absolute position (in the input+output index space)
             of the first answer token, i.e. the token immediately after `</think>`.
+        committed_len: number of tokens whose KV is actually committed
+            (``req.kv_committed_len``). The final generated token can appear in
+            output_ids while its KV slot is uncommitted (overlap scheduling), in which
+            case its req_to_token entry is the zero/unwritten sentinel (reserved page 0).
+            Walking past committed_len would move/free that sentinel and double-free
+            page 0, so we cap here exactly as the normal cache_finished_req path does.
 
     Returns:
-        NoCacheThoughtsSplit with:
-        * virtual_token_ids: input + post-`</think>` answer (thoughts removed).
-        * virtual_kv_indices: kv_indices for those tokens, gathered from req_to_token_slot.
-        * virtual_positions: matching original RoPE positions; non-contiguous between
-          input_len-1 and answer_start_position.
-        * thought_kv_indices_to_free: kv_indices for slots covering the thought slice.
+        NoCacheThoughtsSplit (see that dataclass for field semantics): the cached key
+        sequence (input + answer), the request's committed slot span, the kept tokens'
+        original RoPE positions, and the move_src/move_dst slot tensors that relocate
+        the answer's KV into page-congruent slots.
 
-    When answer_start_position >= len(input) + len(output), the answer hasn't been
-    generated yet (e.g. the request was cut off mid-thought) and the result contains
-    only the input prompt slice.
+    When answer_start_position >= committed_len, the answer hasn't been committed
+    (e.g. the request was cut off mid-thought) and the result caches only the input
+    prompt slice (no relocation).
     """
     input_len = len(origin_input_ids)
-    total_len = input_len + len(output_ids)
+    # Cap at the committed KV length (see committed_len arg): never touch the
+    # uncommitted trailing token's unwritten (page-0) slot.
+    total_len = min(input_len + len(output_ids), committed_len)
 
     # Clamp answer_start so we behave sanely if reasoning never finished.
     answer_start = min(answer_start_position, total_len)
 
-    # Slots / positions for input prompt + post-</think> answer.
+    think_len = answer_start - input_len  # decoded thought tokens to drop
+    answer_count = max(total_len - answer_start, 0)
+    answer_output_offset = answer_start - input_len  # index into output_ids
+    kept_len = input_len + answer_count  # cached sequence length (= total_len - think_len)
+
     # The full input prompt (including any <think>\n priming tail from
     # add_generation_prompt) stays in the cached entry — TITO rollouts feed
     # turn N+1's input as raw token IDs that include turn N's prompt verbatim,
-    # so keeping the priming preserves cache alignment in that flow.
-    answer_count = max(total_len - answer_start, 0)
-    answer_output_offset = answer_start - input_len  # index into output_ids
-
+    # so keeping the priming preserves cache alignment in that flow. The answer slice
+    # is bounded by answer_count so an uncommitted trailing token is never cached.
     virtual_token_ids = list(origin_input_ids) + list(
-        output_ids[answer_output_offset:] if answer_count > 0 else []
+        output_ids[answer_output_offset : answer_output_offset + answer_count]
+        if answer_count > 0
+        else []
     )
 
-    kept_slot_indices = list(range(input_len)) + list(range(answer_start, total_len))
+    # Original RoPE positions of the kept tokens: input is contiguous, then the answer
+    # keeps its ORIGINAL positions (a gap where the thoughts were). The K vectors already
+    # encode these positions, so we must not renumber them; only the physical slots move.
     kept_positions = list(range(input_len)) + list(range(answer_start, total_len))
-    # Free the decoded thought slots (between the input prompt and </think>).
-    # These were allocated during decode and are owned by the request — safe
-    # to free without affecting the radix entry that cache_unfinished_req
-    # inserted at prefill time (which only owns the input-prompt slots).
-    thought_slot_indices = list(range(input_len, answer_start))
 
     device = req_to_token_slot.device
-    if kept_slot_indices:
-        idx_tensor = torch.tensor(kept_slot_indices, dtype=torch.int64, device=device)
-        virtual_kv_indices = req_to_token_slot[idx_tensor].to(torch.int64).clone()
+    slots = req_to_token_slot.to(torch.int64)
+
+    # Hand cache_finished_req the request's FULL original slot span. It takes cached
+    # values from slots[:page_aligned(kept_len)] (after the move) and frees
+    # slots[page_aligned(kept_len):] in a single page-aligned cut — that one cut covers
+    # both the stale thought slots and the answer's unaligned tail with no boundary
+    # double-free.
+    virtual_kv_indices = slots[:total_len].clone()
+
+    # Relocate the answer's KV LEFT by think_len slots so each answer token lands on the
+    # slot that originally held its NEW index (slot % page_size == index % page_size).
+    # The destination slots[input_len:kept_len] are exactly the thought slots plus the
+    # answer's leading slots — all owned privately by this finished request, so the move
+    # cannot disturb the shared input prefix already in the radix. Skip when there is no
+    # thought span (already aligned) or no answer (nothing to relocate).
+    if think_len > 0 and answer_count > 0:
+        move_src = slots[answer_start:total_len].clone()
+        move_dst = slots[input_len:kept_len].clone()
     else:
-        virtual_kv_indices = torch.empty((0,), dtype=torch.int64, device=device)
+        move_src = torch.empty((0,), dtype=torch.int64, device=device)
+        move_dst = torch.empty((0,), dtype=torch.int64, device=device)
 
     virtual_positions = torch.tensor(kept_positions, dtype=torch.int64, device=device)
-
-    if thought_slot_indices:
-        t_idx = torch.tensor(thought_slot_indices, dtype=torch.int64, device=device)
-        thought_kv_indices_to_free = req_to_token_slot[t_idx].to(torch.int64).clone()
-    else:
-        thought_kv_indices_to_free = torch.empty((0,), dtype=torch.int64, device=device)
 
     return NoCacheThoughtsSplit(
         virtual_token_ids=virtual_token_ids,
         virtual_kv_indices=virtual_kv_indices,
         virtual_positions=virtual_positions,
-        thought_kv_indices_to_free=thought_kv_indices_to_free,
+        move_src=move_src,
+        move_dst=move_dst,
     )
 
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
@@ -666,6 +700,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             output_ids=req.output_ids,
             req_to_token_slot=req_to_token_slot,
             answer_start_position=req.answer_start_position,
+            committed_len=req.kv_committed_len,
         )
         tree_cache.cache_finished_req(req, is_insert=is_insert, split=split)
     else:
