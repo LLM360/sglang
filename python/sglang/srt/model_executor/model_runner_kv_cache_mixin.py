@@ -695,6 +695,9 @@ class ModelRunnerKVCacheMixin:
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
+                            # --no-cache-thoughts relocates the answer KV via
+                            # move_kv_cache when it drops a finished think span
+                            or self.server_args.no_cache_thoughts
                         ),
                     )
                 else:
@@ -714,6 +717,9 @@ class ModelRunnerKVCacheMixin:
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
+                            # --no-cache-thoughts relocates the answer KV via
+                            # move_kv_cache when it drops a finished think span
+                            or self.server_args.no_cache_thoughts
                         ),
                     )
 
