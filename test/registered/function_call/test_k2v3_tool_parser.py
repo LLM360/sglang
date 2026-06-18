@@ -582,6 +582,40 @@ class TestK2V3RegistryWiring(unittest.TestCase):
         self.assertIsInstance(parser.detector, K2V3Detector)
         self.assertEqual(parser.detector.tool_format, "xml")
 
+    def test_registry_uses_tool_call_format_dialects_from_template(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        tools = [_make_tool("get_weather")]
+        cases = {
+            "json": (
+                '<ifm|tool_call>{"name": "get_weather", '
+                '"arguments": {"city": "Tokyo"}}</ifm|tool_call>'
+            ),
+            "xml_typed": (
+                "<ifm|tool_call>get_weather"
+                "<ifm|arg_key>city</ifm|arg_key>"
+                "<ifm|arg_type>string</ifm|arg_type>"
+                "<ifm|arg_value>Tokyo</ifm|arg_value>"
+                "</ifm|tool_call>"
+            ),
+        }
+
+        for dialect, wire_output in cases.items():
+            with self.subTest(dialect=dialect):
+                parser = FunctionCallParser(
+                    tools=tools,
+                    tool_call_parser="k2_v3",
+                    chat_template_kwargs={"tool_call_format": dialect},
+                )
+                self.assertIsInstance(parser.detector, K2V3Detector)
+                self.assertEqual(parser.detector.tool_format, dialect)
+
+                normal_text, calls = parser.parse_non_stream(wire_output)
+                self.assertEqual(normal_text, "")
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0].name, "get_weather")
+                self.assertEqual(json.loads(calls[0].parameters), {"city": "Tokyo"})
+
     def test_registry_rejects_alias_format_kwargs(self):
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
