@@ -423,73 +423,93 @@ class MultiFormatDetector(BaseFormatDetector):
         current_text = self._buffer
         start_token = self._IFM_TOOL_CALL_START_TOKEN
 
-        if start_token not in current_text:
-            emit, hold = self._ifm_split_normal_text(current_text)
-            self._buffer = hold
-            return StreamingParseResult(normal_text=emit)
-
         normal_text = ""
-        first_idx = current_text.find(start_token)
-        if first_idx > 0:
-            normal_text = self._ifm_prefix_normal_text(current_text[:first_idx])
-            current_text = current_text[first_idx:]
-            self._buffer = current_text
+        calls: List[ToolCallItem] = []
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
-        calls: List[ToolCallItem] = []
         try:
-            partial_match = self._IFM_STREAM_TOOL_CALL_REGEX.search(current_text)
-            if not partial_match:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
+            while current_text:
+                if start_token not in current_text:
+                    if calls:
+                        self._buffer = current_text
+                        break
+                    emit, hold = self._ifm_split_normal_text(current_text)
+                    normal_text += emit
+                    self._buffer = hold
+                    break
 
-            func_name = partial_match.group(1).strip()
-            func_args_raw = (
-                partial_match.group(2).strip() if partial_match.group(2) else ""
-            )
-            is_tool_end = partial_match.group(3) or ""
-
-            if self.current_tool_id == -1:
-                self.current_tool_id = 0
-                self.prev_tool_call_arr = []
-                self.streamed_args_for_tool = [""]
-                self._streamed_raw_length = 0
-                self.current_tool_name_sent = False
-                self._reset_ifm_stream_state()
-
-            while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
-            while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                self.streamed_args_for_tool.append("")
-
-            has_arg_key = self._IFM_ARG_KEY_OPEN_PREFIX in current_text
-
-            name_item = self._ifm_send_tool_name(func_name, has_arg_key, is_tool_end)
-            if name_item:
-                calls.append(name_item)
-
-            if self.current_tool_name_sent:
-                arg_item = self._ifm_process_arguments(func_name, func_args_raw, tools)
-                if arg_item:
-                    calls.append(arg_item)
-
-                if (
-                    is_tool_end == self._IFM_TOOL_CALL_END_TOKEN
-                    and not self._ifm_tool_completed
-                ):
-                    calls.extend(
-                        self._finalize_ifm_xml_tool_call(
-                            func_name, func_args_raw, tools
-                        )
+                first_idx = current_text.find(start_token)
+                if first_idx > 0:
+                    if calls:
+                        self._buffer = current_text
+                        break
+                    normal_text += self._ifm_prefix_normal_text(
+                        current_text[:first_idx]
                     )
-                    self._buffer = current_text[partial_match.end() :]
-                    self.current_tool_id += 1
-                    self._last_arguments = ""
-                    self.current_tool_name_sent = False
+                    current_text = current_text[first_idx:]
+
+                partial_match = self._IFM_STREAM_TOOL_CALL_REGEX.search(current_text)
+                if not partial_match:
+                    self._buffer = current_text
+                    break
+
+                func_name = partial_match.group(1).strip()
+                func_args_raw = (
+                    partial_match.group(2).strip() if partial_match.group(2) else ""
+                )
+                is_tool_end = partial_match.group(3) or ""
+
+                if self.current_tool_id == -1:
+                    self.current_tool_id = 0
+                    self.prev_tool_call_arr = []
+                    self.streamed_args_for_tool = [""]
                     self._streamed_raw_length = 0
+                    self.current_tool_name_sent = False
                     self._reset_ifm_stream_state()
-                    return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
+
+                matched_text = current_text[: partial_match.end()]
+                has_arg_key = self._IFM_ARG_KEY_OPEN_PREFIX in matched_text
+
+                name_item = self._ifm_send_tool_name(
+                    func_name, has_arg_key, is_tool_end
+                )
+                if name_item:
+                    calls.append(name_item)
+
+                if self.current_tool_name_sent:
+                    arg_item = self._ifm_process_arguments(
+                        func_name, func_args_raw, tools
+                    )
+                    if arg_item:
+                        calls.append(arg_item)
+
+                    if (
+                        is_tool_end == self._IFM_TOOL_CALL_END_TOKEN
+                        and not self._ifm_tool_completed
+                    ):
+                        calls.extend(
+                            self._finalize_ifm_xml_tool_call(
+                                func_name, func_args_raw, tools
+                            )
+                        )
+                        current_text = current_text[partial_match.end() :]
+                        self._buffer = current_text
+                        self.current_tool_id += 1
+                        self._last_arguments = ""
+                        self.current_tool_name_sent = False
+                        self._streamed_raw_length = 0
+                        self._reset_ifm_stream_state()
+                        continue
+
+                self._buffer = current_text
+                break
 
         except Exception:
             logger.exception(

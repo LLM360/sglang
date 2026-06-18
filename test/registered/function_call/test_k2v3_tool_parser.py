@@ -363,6 +363,21 @@ class TestK2V3XmlStreaming(unittest.TestCase):
         self.assertEqual(json.loads(calls[0]["parameters"]), {"city": "Tokyo"})
         self.assertEqual(json.loads(calls[1]["parameters"]), {"city": "Osaka"})
 
+    def test_multiple_calls_same_chunk(self):
+        combined = (
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
+            "</ifm|tool_call>"
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Osaka</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+        normal, calls = _collect_stream(K2V3Detector(), self.tools, [combined])
+        self.assertEqual(normal, "")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(json.loads(calls[0]["parameters"]), {"city": "Tokyo"})
+        self.assertEqual(json.loads(calls[1]["parameters"]), {"city": "Osaka"})
+
     def test_multiple_calls_char_by_char(self):
         combined = (
             "<ifm|tool_call>get_weather"
@@ -399,6 +414,43 @@ class TestK2V3XmlStreaming(unittest.TestCase):
         normal, calls = _collect_stream(K2V3Detector(), self.tools, list(wire))
         self.assertEqual(normal, "Sure, let me check.")
         self.assertEqual(calls[0]["name"], "get_weather")
+
+    def test_normal_text_after_tool_call_is_buffered(self):
+        det = K2V3Detector()
+        first = det.parse_streaming_increment(
+            f"Before {self.block}After", self.tools
+        )
+        self.assertEqual(first.normal_text, "Before ")
+        self.assertTrue(any(call.name == "get_weather" for call in first.calls))
+
+        second = det.parse_streaming_increment(" later", self.tools)
+        self.assertEqual(second.normal_text, "After later")
+        self.assertEqual(second.calls, [])
+
+    def test_normal_text_between_tool_calls_splits_results(self):
+        det = K2V3Detector()
+        block_b = (
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Osaka</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+        first = det.parse_streaming_increment(
+            f"{self.block}Between{block_b}", self.tools
+        )
+        self.assertEqual(first.normal_text, "")
+        self.assertEqual(
+            [call.name for call in first.calls if call.name], ["get_weather"]
+        )
+
+        second = det.parse_streaming_increment("Tail", self.tools)
+        self.assertEqual(second.normal_text, "Between")
+        self.assertEqual(
+            [call.name for call in second.calls if call.name], ["get_weather"]
+        )
+
+        third = det.parse_streaming_increment(" done", self.tools)
+        self.assertEqual(third.normal_text, "Tail done")
+        self.assertEqual(third.calls, [])
 
 
 class TestK2V3XmlTypedStreaming(unittest.TestCase):
