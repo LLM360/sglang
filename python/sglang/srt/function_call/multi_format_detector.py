@@ -1111,14 +1111,25 @@ class K2V3Detector(MultiFormatDetector):
     Parses ``<ifm|tool_call>`` blocks and strips leading IFM reasoning-effort
     blocks (``<ifm|think>``/``<ifm|think_fast>``/``<ifm|think_faster>``) off the
     normal-text prefix. Defaults to the IFM ``xml`` dialect, overridable via the
-    ``tool_call_format`` chat-template kwarg (matching vLLM's key).
+    ``tool_call_format`` chat-template kwarg. The legacy/alternate
+    ``tool_format`` and ``tool_calling_format`` kwargs are rejected to match
+    vLLM's K2-V3 parser contract.
     """
+
+    _UNSUPPORTED_TOOL_FORMAT_KWARG_KEYS = ("tool_calling_format", "tool_format")
 
     def __init__(
         self,
         tool_format: Optional[str] = None,
         chat_template_kwargs: Optional[dict] = None,
     ):
-        if tool_format is None and chat_template_kwargs:
-            tool_format = chat_template_kwargs.get("tool_call_format")
+        if chat_template_kwargs:
+            for key in self._UNSUPPORTED_TOOL_FORMAT_KWARG_KEYS:
+                if key in chat_template_kwargs:
+                    raise ValueError(
+                        f"Unsupported argument: {key}. Use tool_call_format to "
+                        "specify the K2-V3 tool-call dialect."
+                    )
+            if tool_format is None:
+                tool_format = chat_template_kwargs.get("tool_call_format")
         super().__init__(tool_format=tool_format or "xml")

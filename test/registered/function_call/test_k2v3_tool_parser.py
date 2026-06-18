@@ -47,6 +47,18 @@ class TestK2V3DetectorConstruction(unittest.TestCase):
         det = K2V3Detector(chat_template_kwargs={"tool_call_format": "xml_typed"})
         self.assertEqual(det.tool_format, "xml_typed")
 
+    def test_tool_format_kwarg_is_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError, "Unsupported argument: tool_format"
+        ):
+            K2V3Detector(chat_template_kwargs={"tool_format": "json"})
+
+    def test_tool_calling_format_kwarg_is_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError, "Unsupported argument: tool_calling_format"
+        ):
+            K2V3Detector(chat_template_kwargs={"tool_calling_format": "xml_typed"})
+
     def test_json_dialect_via_positional(self):
         det = K2V3Detector(tool_format="json")
         self.assertEqual(det.tool_format, "json")
@@ -569,6 +581,21 @@ class TestK2V3RegistryWiring(unittest.TestCase):
         )
         self.assertIsInstance(parser.detector, K2V3Detector)
         self.assertEqual(parser.detector.tool_format, "xml")
+
+    def test_registry_rejects_alias_format_kwargs(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        tools = [_make_tool("get_weather")]
+        for key in ("tool_format", "tool_calling_format"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(
+                    ValueError, f"Unsupported argument: {key}"
+                ):
+                    FunctionCallParser(
+                        tools=tools,
+                        tool_call_parser="k2_v3",
+                        chat_template_kwargs={key: "json"},
+                    )
 
     def test_full_pipeline_non_stream(self):
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
