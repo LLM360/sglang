@@ -479,7 +479,7 @@ class MistralDetector(BaseReasoningFormatDetector):
 
 class K2V3Detector(BaseReasoningFormatDetector):
     """
-    Detector for the K2-v3 model family.
+    Detector for the K2-v3 (IFM) model family.
 
     K2-v3 supports three reasoning effort levels, each using a different
     think token pair selected via ``reasoning_effort`` in
@@ -488,36 +488,27 @@ class K2V3Detector(BaseReasoningFormatDetector):
       - medium:         <ifm|think_fast> / </ifm|think_fast>
       - low:            <ifm|think_faster> / </ifm|think_faster>
 
-    For backward compatibility, the previous-generation token pairs are also
-    accepted on input and normalized to the canonical tokens above:
-      - high:   <think> / </think>
-      - medium: <think_fast> / </think_fast>
-      - low:    <think_faster> / </think_faster>
-
-    NOTE: legacy reasoning tokens are only supported in non-streaming
-    (one-shot) generation. Streaming increments use the canonical tokens only,
-    since a legacy token split across chunk boundaries cannot be reliably
-    normalized without buffering in the base state machine.
+    A tool call begins with ``<ifm|tool_call>``; when the model emits one
+    without first closing the think block, reasoning is split at that boundary.
 
     The chat template inserts the start token into the prompt, so the
     generated output typically contains only the end token. Parsing therefore
     requires forced reasoning mode.
+
+    The previous-generation token format (``<think>`` / ``<tool_call>``) is
+    handled separately by :class:`K2V3DetectorLegacy` (CLI: ``k2_v3_legacy``).
     """
 
+    # Reasoning token pairs keyed by effort level.
     _EFFORT_TOKENS: dict = {
         "high": ("<ifm|think>", "</ifm|think>"),
         "medium": ("<ifm|think_fast>", "</ifm|think_fast>"),
         "low": ("<ifm|think_faster>", "</ifm|think_faster>"),
     }
 
-    # Legacy token pairs retained for backward compatibility. Indexed by the
-    # same effort keys as ``_EFFORT_TOKENS`` so each legacy pair maps onto its
-    # canonical replacement.
-    _LEGACY_EFFORT_TOKENS: dict = {
-        "high": ("<think>", "</think>"),
-        "medium": ("<think_fast>", "</think_fast>"),
-        "low": ("<think_faster>", "</think_faster>"),
-    }
+    # Boundary that ends reasoning when a tool call is emitted before the think
+    # end token.
+    _TOOL_START_TOKEN: str = "<ifm|tool_call>"
 
     def __init__(
         self,
@@ -531,48 +522,45 @@ class K2V3Detector(BaseReasoningFormatDetector):
             raise ValueError("K2-v3 reasoning parser requires force_reasoning=True")
 
         effort = reasoning_effort or "high"
-        if effort == "none":
-            effort = "high"
-        if effort not in self._EFFORT_TOKENS:
+        if effort == "none" or effort not in self._EFFORT_TOKENS:
             effort = "high"
         start_token, end_token = self._EFFORT_TOKENS[effort]
-        self._legacy_start_token, self._legacy_end_token = self._LEGACY_EFFORT_TOKENS[
-            effort
-        ]
-
-        # Normalize any legacy tokens already present in prior turn content so
-        # the base class state machine only ever sees canonical tokens.
-        previous_content = self._normalize_legacy_tokens(
-            previous_content, start_token, end_token
-        )
 
         super().__init__(
             start_token,
             end_token,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
-            tool_start_token="<tool_call>",
+            tool_start_token=self._TOOL_START_TOKEN,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
         )
 
-    def _normalize_legacy_tokens(
-        self, text: str, start_token: str = None, end_token: str = None
-    ) -> str:
-        """Rewrite legacy think tokens to their canonical equivalents."""
-        if not text:
-            return text
-        start_token = start_token or self.think_start_token
-        end_token = end_token or self.think_end_token
-        if self._legacy_start_token in text:
-            text = text.replace(self._legacy_start_token, start_token)
-        if self._legacy_end_token in text:
-            text = text.replace(self._legacy_end_token, end_token)
-        return text
 
-    def detect_and_parse(self, text: str) -> StreamingParseResult:
-        # Legacy tokens are normalized here (non-streaming path only).
-        return super().detect_and_parse(self._normalize_legacy_tokens(text))
+class K2V3DetectorLegacy(K2V3Detector):
+    """
+    Detector for the previous-generation K2-v3 token format.
+
+    Behaves exactly like :class:`K2V3Detector` (same effort-level selection and
+    forced-reasoning semantics) but uses the legacy think token pairs and the
+    legacy ``<tool_call>`` boundary:
+      - high (default): <think> / </think>
+      - medium:         <think_fast> / </think_fast>
+      - low:            <think_faster> / </think_faster>
+
+    Use this when serving an older K2-v3 checkpoint whose chat template emits
+    the pre-IFM tokens (CLI: ``k2_v3_legacy``). Because these tokens are native
+    here rather than normalized, streaming and non-streaming parsing behave
+    identically.
+    """
+
+    _EFFORT_TOKENS: dict = {
+        "high": ("<think>", "</think>"),
+        "medium": ("<think_fast>", "</think_fast>"),
+        "low": ("<think_faster>", "</think_faster>"),
+    }
+
+    _TOOL_START_TOKEN: str = "<tool_call>"
 
 
 class ReasoningParser:
@@ -604,6 +592,7 @@ class ReasoningParser:
         "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
         "k2_v3": K2V3Detector,
+        "k2_v3_legacy": K2V3DetectorLegacy,
     }
 
     def __init__(
@@ -646,7 +635,7 @@ class ReasoningParser:
         # pops reasoning_effort out of chat_template_kwargs and promotes it to
         # request.reasoning_effort (see serving_chat.py); fall back to the
         # kwargs dict for callers that bypass that normalization.
-        if model_type.lower() == "k2_v3":
+        if model_type.lower() in ("k2_v3", "k2_v3_legacy"):
             effort = (
                 getattr(request, "reasoning_effort", None)
                 or chat_template_kwargs.get("reasoning_effort")
