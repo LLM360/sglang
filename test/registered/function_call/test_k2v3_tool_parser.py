@@ -10,6 +10,7 @@ import unittest
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.multi_format_detector import (
     K2V3Detector,
+    K2V3DetectorTracking,
     MultiFormatDetector,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -258,6 +259,166 @@ def _collect_stream(detector, tools, chunks):
             if item.parameters:
                 by_index[idx]["parameters"] += item.parameters
     return normal_text, [by_index[i] for i in order]
+
+
+def _event_types(detector):
+    return [event["type"] for event in detector.fallback_events]
+
+
+class TestK2V3DetectorTracking(unittest.TestCase):
+    """Opt-in K2-v3 detector that records selected non-stream fallbacks."""
+
+    def setUp(self):
+        self.tools = [
+            _make_tool(
+                "study_args",
+                {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "flag": {"type": "boolean"},
+                        "payload": {"type": "object"},
+                        "user_id": {"type": "string"},
+                    },
+                },
+            )
+        ]
+
+    @staticmethod
+    def _call_tuple(call):
+        return call.tool_index, call.name, call.parameters
+
+    def test_output_matches_base_detector_for_supported_dialects(self):
+        cases = {
+            "xml": (
+                "<ifm|tool_call>study_args"
+                "<ifm|arg_key>city</ifm|arg_key>"
+                "<ifm|arg_value>Tokyo</ifm|arg_value>"
+                "</ifm|tool_call>"
+            ),
+            "xml_typed": (
+                "<ifm|tool_call>study_args"
+                "<ifm|arg_key>user_id</ifm|arg_key>"
+                "<ifm|arg_type>string</ifm|arg_type>"
+                "<ifm|arg_value>12345</ifm|arg_value>"
+                "</ifm|tool_call>"
+            ),
+            "json": (
+                "<ifm|tool_call>"
+                '{"name": "study_args", "arguments": {"city": "Tokyo"}}'
+                "</ifm|tool_call>"
+            ),
+        }
+
+        for dialect, text in cases.items():
+            with self.subTest(dialect=dialect):
+                base = K2V3Detector(tool_format=dialect).detect_and_parse(
+                    text, self.tools
+                )
+                tracked_detector = K2V3DetectorTracking(tool_format=dialect)
+                tracked = tracked_detector.detect_and_parse(text, self.tools)
+
+                self.assertEqual(tracked.normal_text, base.normal_text)
+                self.assertEqual(
+                    [self._call_tuple(call) for call in tracked.calls],
+                    [self._call_tuple(call) for call in base.calls],
+                )
+
+    def test_tracks_json_failure_before_ast_literal_eval(self):
+        detector = K2V3DetectorTracking()
+        text = (
+            "<ifm|tool_call>study_args"
+            "<ifm|arg_key>flag</ifm|arg_key>"
+            "<ifm|arg_value>True</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+
+        result = detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(json.loads(result.calls[0].parameters), {"flag": True})
+        self.assertEqual(
+            _event_types(detector), ["json_loads_failed_ast_literal_eval"]
+        )
+        self.assertEqual(detector.fallback_events[0]["phase"], "coercion")
+
+    def test_tracks_raw_string_after_json_and_ast_fail(self):
+        detector = K2V3DetectorTracking()
+        text = (
+            "<ifm|tool_call>study_args"
+            "<ifm|arg_key>payload</ifm|arg_key>"
+            "<ifm|arg_value>abc</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+
+        result = detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(json.loads(result.calls[0].parameters), {"payload": "abc"})
+        self.assertEqual(
+            _event_types(detector),
+            [
+                "json_loads_failed_ast_literal_eval",
+                "ast_literal_eval_failed_raw_string",
+            ],
+        )
+
+    def test_string_schema_does_not_track_deserialization_fallbacks(self):
+        detector = K2V3DetectorTracking()
+        text = (
+            "<ifm|tool_call>study_args"
+            "<ifm|arg_key>user_id</ifm|arg_key>"
+            "<ifm|arg_value>12345</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+
+        result = detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"user_id": "12345"}
+        )
+        self.assertEqual(detector.fallback_events, [])
+
+    def test_tracks_ifm_reasoning_prefix_stripped(self):
+        detector = K2V3DetectorTracking()
+        text = (
+            "<ifm|think>need lookup</ifm|think>\n"
+            "<ifm|tool_call>study_args"
+            "<ifm|arg_key>city</ifm|arg_key>"
+            "<ifm|arg_value>Tokyo</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+
+        result = detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(_event_types(detector), ["ifm_reasoning_prefix_stripped"])
+        self.assertEqual(detector.fallback_events[0]["phase"], "non_stream")
+
+    def test_clear_fallback_events(self):
+        detector = K2V3DetectorTracking()
+        detector._record_fallback("json_loads_failed_ast_literal_eval", "coercion")
+
+        detector.clear_fallback_events()
+
+        self.assertEqual(detector.fallback_events, [])
+
+    def test_streaming_does_not_record_fallback_events(self):
+        detector = K2V3DetectorTracking()
+        wire = (
+            "<ifm|think>need lookup</ifm|think>\n"
+            "<ifm|tool_calls>\n"
+            "<ifm|tool_call>study_args"
+            "<ifm|arg_key>city</ifm|arg_key>"
+            "<ifm|arg_value>Tokyo</ifm|arg_value>"
+            "</ifm|tool_call>\n"
+            "</ifm|tool_calls>"
+        )
+
+        normal, calls = _collect_stream(detector, self.tools, list(wire))
+
+        self.assertEqual(normal.strip(), "")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["parameters"]), {"city": "Tokyo"})
+        self.assertEqual(detector.fallback_events, [])
 
 
 class TestK2V3XmlStreaming(unittest.TestCase):
@@ -581,6 +742,20 @@ class TestK2V3RegistryWiring(unittest.TestCase):
         )
         self.assertIsInstance(parser.detector, K2V3Detector)
         self.assertEqual(parser.detector.tool_format, "xml")
+
+    def test_registry_builds_k2v3_tracking_detector(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        tools = [_make_tool("get_weather")]
+        parser = FunctionCallParser(
+            tools=tools,
+            tool_call_parser="k2_v3_tracking",
+            chat_template_kwargs={"tool_call_format": "xml"},
+        )
+
+        self.assertIsInstance(parser.detector, K2V3DetectorTracking)
+        self.assertEqual(parser.detector.tool_format, "xml")
+        self.assertEqual(parser.detector.fallback_events, [])
 
     def test_registry_uses_tool_call_format_dialects_from_template(self):
         from sglang.srt.function_call.function_call_parser import FunctionCallParser

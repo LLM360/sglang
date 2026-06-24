@@ -1133,3 +1133,131 @@ class K2V3Detector(MultiFormatDetector):
             if tool_format is None:
                 tool_format = chat_template_kwargs.get("tool_call_format")
         super().__init__(tool_format=tool_format or "xml")
+
+
+class K2V3DetectorTracking(K2V3Detector):
+    """K2-V3 tool parser variant that records selected fallback events.
+
+    This detector intentionally keeps tracking opt-in so the default ``k2_v3``
+    parser remains unchanged. It records non-stream coercion fallbacks and IFM
+    reasoning-prefix cleanup while preserving the parsed output.
+    """
+
+    def __init__(
+        self,
+        tool_format: Optional[str] = None,
+        chat_template_kwargs: Optional[dict] = None,
+    ):
+        self.fallback_events: list[dict[str, Any]] = []
+        self._suppress_fallback_tracking = False
+        super().__init__(
+            tool_format=tool_format, chat_template_kwargs=chat_template_kwargs
+        )
+
+    def clear_fallback_events(self) -> None:
+        self.fallback_events.clear()
+
+    def _record_fallback(
+        self, fallback_type: str, phase: str, **details: Any
+    ) -> None:
+        if self._suppress_fallback_tracking:
+            return
+        self.fallback_events.append(
+            {"type": fallback_type, "phase": phase, "details": details}
+        )
+
+    @staticmethod
+    def _preview_value(value: Any, limit: int = 120) -> str:
+        preview = str(value)
+        if len(preview) > limit:
+            return preview[: limit - 3] + "..."
+        return preview
+
+    def parse_streaming_increment(
+        self, new_text: str, tools: List[Tool]
+    ) -> StreamingParseResult:
+        previous = self._suppress_fallback_tracking
+        self._suppress_fallback_tracking = True
+        try:
+            return super().parse_streaming_increment(new_text, tools)
+        finally:
+            self._suppress_fallback_tracking = previous
+
+    def _ifm_prefix(self, text: str, first_match_index: int) -> str:
+        group_index = text.find(self._IFM_TOOL_CALLS_START_TOKEN)
+        cut = group_index if group_index != -1 else first_match_index
+        if cut <= 0:
+            return ""
+        prefix = text[:cut]
+        content = self._strip_ifm_reasoning_prefix(prefix)
+        if content != prefix:
+            self._record_fallback(
+                "ifm_reasoning_prefix_stripped",
+                "non_stream",
+                tool_format=self.tool_format,
+                prefix_preview=self._preview_value(prefix),
+            )
+        return content if content.strip() else ""
+
+    def _deserialize_glm_value_tracking(
+        self,
+        value: str,
+        tool_name: str,
+        arg_name: str,
+        target_type: Any,
+    ) -> Any:
+        value = value.strip()
+        try:
+            return json.loads(value)
+        except Exception as json_error:
+            self._record_fallback(
+                "json_loads_failed_ast_literal_eval",
+                "coercion",
+                tool_name=tool_name,
+                arg_name=arg_name,
+                target_type=target_type,
+                value_preview=self._preview_value(value),
+                error=json_error.__class__.__name__,
+            )
+        try:
+            return ast.literal_eval(value)
+        except Exception as ast_error:
+            self._record_fallback(
+                "ast_literal_eval_failed_raw_string",
+                "coercion",
+                tool_name=tool_name,
+                arg_name=arg_name,
+                target_type=target_type,
+                value_preview=self._preview_value(value),
+                error=ast_error.__class__.__name__,
+            )
+        return value
+
+    def _coerce_argument_value(
+        self,
+        value: Any,
+        tool_name: str,
+        arg_name: str,
+        tools: List[Tool],
+        *,
+        arg_type: Optional[str] = None,
+        from_text: bool = False,
+    ) -> Any:
+        target_type = self._schema_arg_type(tool_name, arg_name, tools) or arg_type
+        if self._arg_type_is_string(target_type):
+            return self._json_stringify(value)
+        if isinstance(value, str) and (from_text or target_type is not None):
+            return self._deserialize_glm_value_tracking(
+                value, tool_name, arg_name, target_type
+            )
+        return value
+
+    def _coerce_arguments(
+        self, tool_name: str, arguments: dict[str, Any], tools: List[Tool]
+    ) -> dict[str, Any]:
+        return {
+            arg_name: self._coerce_argument_value(
+                arg_value, tool_name, arg_name, tools
+            )
+            for arg_name, arg_value in arguments.items()
+        }

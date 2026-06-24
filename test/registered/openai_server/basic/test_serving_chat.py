@@ -213,6 +213,99 @@ class ServingChatTestCase(unittest.TestCase):
             second_tools, [tool.function.model_dump() for tool in req.tools]
         )
 
+    def test_k2v3_tracking_fallback_events_are_added_to_meta_info(self):
+        self.chat.tool_call_parser = "k2_v3_tracking"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Set flag"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "study_args",
+                        "description": "Study parser arguments.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"flag": {"type": "boolean"}},
+                        },
+                    },
+                }
+            ],
+            return_meta_info=True,
+        )
+        ret = [
+            {
+                "text": (
+                    "<ifm|tool_call>study_args"
+                    "<ifm|arg_key>flag</ifm|arg_key>"
+                    "<ifm|arg_value>True</ifm|arg_value>"
+                    "</ifm|tool_call>"
+                ),
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 9,
+                    "reasoning_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "test",
+                },
+                "index": 0,
+            }
+        ]
+
+        response = self.chat._build_chat_response(req, ret, created=0)
+
+        choice = response.choices[0]
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(
+            json.loads(choice.message.tool_calls[0].function.arguments),
+            {"flag": True},
+        )
+        events = choice.meta_info["tool_parser_fallback_events"]
+        self.assertEqual(events[0]["type"], "json_loads_failed_ast_literal_eval")
+        self.assertEqual(events[0]["phase"], "coercion")
+        self.assertEqual(events[0]["details"]["tool_name"], "study_args")
+
+    def test_k2v3_reasoning_tracking_events_are_added_to_meta_info(self):
+        self.chat.reasoning_parser = "k2_v3_tracking"
+        self.template_manager.force_reasoning = True
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Call a tool"}],
+            return_meta_info=True,
+        )
+        ret = [
+            {
+                "text": (
+                    "Need to call the tool.\n"
+                    "<ifm|tool_call>study_args"
+                    "<ifm|arg_key>flag</ifm|arg_key>"
+                    "<ifm|arg_value>True</ifm|arg_value>"
+                    "</ifm|tool_call>"
+                ),
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 9,
+                    "reasoning_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "test",
+                },
+                "index": 0,
+            }
+        ]
+
+        response = self.chat._build_chat_response(req, ret, created=0)
+
+        choice = response.choices[0]
+        self.assertEqual(choice.message.reasoning_content, "Need to call the tool.\n")
+        events = choice.meta_info["reasoning_parser_fallback_events"]
+        self.assertEqual(events[0]["type"], "tool_start_token_fallback")
+        self.assertEqual(events[0]["phase"], "non_stream")
+        self.assertEqual(events[0]["details"]["tool_start_token"], "<ifm|tool_call>")
+
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
 

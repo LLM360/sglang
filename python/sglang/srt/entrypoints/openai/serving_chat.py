@@ -1066,6 +1066,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         request=request,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
+                    self._attach_reasoning_parser_fallback_events(
+                        ret_item["meta_info"], parser
+                    )
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -1089,6 +1092,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     history_tool_calls_cnt,
                     chat_template_kwargs=getattr(request, "chat_template_kwargs", None),
+                    meta_info=ret_item["meta_info"],
                 )
 
             # Strip structural special tokens that leaked through because
@@ -1228,6 +1232,32 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             return tool_call_id
 
+    @staticmethod
+    def _attach_reasoning_parser_fallback_events(
+        meta_info: Optional[Dict[str, Any]],
+        parser: ReasoningParser,
+    ) -> None:
+        if meta_info is None:
+            return
+        detector = getattr(parser, "detector", None)
+        fallback_events = getattr(detector, "fallback_events", None)
+        if fallback_events:
+            meta_info["reasoning_parser_fallback_events"] = copy.deepcopy(
+                fallback_events
+            )
+
+    @staticmethod
+    def _attach_tool_parser_fallback_events(
+        meta_info: Optional[Dict[str, Any]],
+        parser: FunctionCallParser,
+    ) -> None:
+        if meta_info is None:
+            return
+        detector = getattr(parser, "detector", None)
+        fallback_events = getattr(detector, "fallback_events", None)
+        if fallback_events:
+            meta_info["tool_parser_fallback_events"] = copy.deepcopy(fallback_events)
+
     def _process_tool_calls(
         self,
         text: str,
@@ -1236,6 +1266,7 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_choice: Optional[Union[str, ToolChoice]] = None,
         history_tool_calls_cnt: int = 0,
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        meta_info: Optional[Dict[str, Any]] = None,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -1290,6 +1321,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason["matched"] = None
             try:
                 text, call_info_list = parser.parse_non_stream(text)
+                self._attach_tool_parser_fallback_events(meta_info, parser)
                 tool_calls = []
                 for call_info in call_info_list:
                     tool_id = self._process_tool_call_id(
@@ -1306,6 +1338,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 return ToolCallProcessingResult(tool_calls, text, finish_reason)
             except Exception as e:
+                self._attach_tool_parser_fallback_events(meta_info, parser)
                 logger.error(f"Tool call parsing error: {e}")
                 # Return error but don't fail the whole request
                 return ToolCallProcessingResult(None, text, finish_reason)

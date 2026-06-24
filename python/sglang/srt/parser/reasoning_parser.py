@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple, Type
+from typing import Any, Dict, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.harmony_parser import HarmonyParser
@@ -536,6 +536,82 @@ class K2V3Detector(BaseReasoningFormatDetector):
             previous_content=previous_content,
         )
 
+class K2V3DetectorTracking(K2V3Detector):
+    """K2-v3 reasoning parser variant that records selected fallback events.
+
+    This keeps fallback instrumentation opt-in. The default ``k2_v3`` parser
+    remains behaviorally unchanged, while ``k2_v3_tracking`` records when the
+    parser recovers from a missing think-end token by splitting at the IFM tool
+    start token.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        reasoning_effort: str = "high",
+    ):
+        self.fallback_events: list[dict[str, Any]] = []
+        self._suppress_fallback_tracking = False
+        super().__init__(
+            stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            reasoning_effort=reasoning_effort,
+        )
+
+    def clear_fallback_events(self) -> None:
+        self.fallback_events.clear()
+
+    def _record_fallback(
+        self, fallback_type: str, phase: str, **details: Any
+    ) -> None:
+        if self._suppress_fallback_tracking:
+            return
+        self.fallback_events.append(
+            {"type": fallback_type, "phase": phase, "details": details}
+        )
+
+    @staticmethod
+    def _preview_value(value: str, limit: int = 120) -> str:
+        if len(value) > limit:
+            return value[: limit - 3] + "..."
+        return value
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        self.clear_fallback_events()
+        in_reasoning = self._in_reasoning or self.think_start_token in text
+        processed_text = text.replace(self.think_start_token, "")
+        if (
+            in_reasoning
+            and self.tool_start_token is not None
+            and self.tool_start_token in processed_text
+            and self.think_end_token not in processed_text
+            and self.think_end_token not in self.previous_content
+        ):
+            tool_idx = processed_text.find(self.tool_start_token)
+            self._record_fallback(
+                "tool_start_token_fallback",
+                "non_stream",
+                think_end_token=self.think_end_token,
+                tool_start_token=self.tool_start_token,
+                tool_start_index=tool_idx,
+                reasoning_preview=self._preview_value(processed_text[:tool_idx]),
+                normal_text_preview=self._preview_value(processed_text[tool_idx:]),
+            )
+        return super().detect_and_parse(text)
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        previous = self._suppress_fallback_tracking
+        self._suppress_fallback_tracking = True
+        try:
+            return super().parse_streaming_increment(new_text)
+        finally:
+            self._suppress_fallback_tracking = previous
+
 
 class K2V3DetectorLegacy(K2V3Detector):
     """
@@ -592,6 +668,7 @@ class ReasoningParser:
         "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
         "k2_v3": K2V3Detector,
+        "k2_v3_tracking": K2V3DetectorTracking,
         "k2_v3_legacy": K2V3DetectorLegacy,
     }
 
@@ -635,7 +712,7 @@ class ReasoningParser:
         # pops reasoning_effort out of chat_template_kwargs and promotes it to
         # request.reasoning_effort (see serving_chat.py); fall back to the
         # kwargs dict for callers that bypass that normalization.
-        if model_type.lower() in ("k2_v3", "k2_v3_legacy"):
+        if model_type.lower() in ("k2_v3", "k2_v3_tracking", "k2_v3_legacy"):
             effort = (
                 getattr(request, "reasoning_effort", None)
                 or chat_template_kwargs.get("reasoning_effort")
