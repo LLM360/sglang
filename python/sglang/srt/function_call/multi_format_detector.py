@@ -265,12 +265,12 @@ class MultiFormatDetector(BaseFormatDetector):
             return text, ""
         return text[:cut], text[cut:]
 
-    def _ifm_prefix_normal_text(self, prefix: str) -> str:
+    def _ifm_prefix_normal_text(self, prefix: str) -> Optional[str]:
         """Normal text from the segment before the first ``<ifm|tool_call>`` in
         the same chunk: reasoning/wrapper stripped while preserving genuine
         whitespace content."""
         emit, _ = self._ifm_split_normal_text(prefix)
-        return emit
+        return emit if emit != "" else None
 
     def _ifm_stream_value_type(
         self, func_name: str, key: str, tools: List[Tool]
@@ -445,9 +445,11 @@ class MultiFormatDetector(BaseFormatDetector):
                     if calls:
                         self._buffer = current_text
                         break
-                    normal_text += self._ifm_prefix_normal_text(
+                    prefix_normal_text = self._ifm_prefix_normal_text(
                         current_text[:first_idx]
                     )
+                    if prefix_normal_text is not None:
+                        normal_text += prefix_normal_text
                     current_text = current_text[first_idx:]
 
                 partial_match = self._IFM_STREAM_TOOL_CALL_REGEX.search(current_text)
@@ -629,7 +631,9 @@ class MultiFormatDetector(BaseFormatDetector):
         normal_text = ""
         first_idx = current_text.find(start_token)
         if first_idx > 0:
-            normal_text = self._ifm_prefix_normal_text(current_text[:first_idx])
+            prefix_normal_text = self._ifm_prefix_normal_text(current_text[:first_idx])
+            if prefix_normal_text is not None:
+                normal_text = prefix_normal_text
             current_text = current_text[first_idx:]
 
         if self.current_tool_id == -1:
