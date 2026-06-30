@@ -267,10 +267,10 @@ class MultiFormatDetector(BaseFormatDetector):
 
     def _ifm_prefix_normal_text(self, prefix: str) -> str:
         """Normal text from the segment before the first ``<ifm|tool_call>`` in
-        the same chunk: reasoning/wrapper stripped, whitespace-only collapsed to
-        "" (matching the non-stream ``_ifm_prefix`` semantics)."""
+        the same chunk: reasoning/wrapper stripped while preserving genuine
+        whitespace content."""
         emit, _ = self._ifm_split_normal_text(prefix)
-        return emit if emit.strip() else ""
+        return emit
 
     def _ifm_stream_value_type(
         self, func_name: str, key: str, tools: List[Tool]
@@ -891,15 +891,15 @@ class MultiFormatDetector(BaseFormatDetector):
 
         vLLM cuts the prefix at the <ifm|tool_calls> wrapper when present,
         else at the first <ifm|tool_call> block, then strips any leading
-        reasoning-effort block. Returns "" when nothing remains (vLLM uses
-        None for the same case).
+        reasoning-effort block. Whitespace-only content before the tool call is
+        preserved.
         """
         group_index = text.find(cls._IFM_TOOL_CALLS_START_TOKEN)
         cut = group_index if group_index != -1 else first_match_index
         if cut <= 0:
             return ""
         content = cls._strip_ifm_reasoning_prefix(text[:cut])
-        return content if content.strip() else ""
+        return content
 
     @classmethod
     def _strip_ifm_reasoning_prefix(cls, content: str) -> str:
@@ -991,7 +991,7 @@ class MultiFormatDetector(BaseFormatDetector):
         r"<ifm\|think>.*?</ifm\|think>|"
         r"<ifm\|think_fast>.*?</ifm\|think_fast>|"
         r"<ifm\|think_faster>.*?</ifm\|think_faster>"
-        r")\s*",
+        r")",
         re.DOTALL,
     )
 

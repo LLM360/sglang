@@ -171,7 +171,35 @@ class TestK2V3ReasoningPrefix(unittest.TestCase):
             "</ifm|tool_calls>"
         )
         result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.normal_text, "\n")
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
+
+    def test_tool_only_preserves_newline_after_reasoning_prefix(self):
+        text = (
+            "<ifm|think>\n</ifm|think>\n"
+            "<ifm|tool_calls>\n"
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
+            "</ifm|tool_call>\n"
+            "</ifm|tool_calls>"
+        )
+        result = self.det.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "\n")
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
+
+    def test_tool_only_preserves_whitespace_prefix_before_tool_calls(self):
+        text = (
+            "\n"
+            "<ifm|tool_calls>\n"
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
+            "</ifm|tool_call>\n"
+            "</ifm|tool_calls>"
+        )
+        result = self.det.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "\n")
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
 
@@ -425,6 +453,12 @@ class TestK2V3XmlStreaming(unittest.TestCase):
         wire = "Sure, let me check.<ifm|tool_call>get_weather</ifm|tool_call>"
         normal, calls = _collect_stream(K2V3Detector(), self.tools, list(wire))
         self.assertEqual(normal, "Sure, let me check.")
+        self.assertEqual(calls[0]["name"], "get_weather")
+
+    def test_whitespace_before_tool_call_is_emitted(self):
+        wire = "\n<ifm|tool_call>get_weather</ifm|tool_call>"
+        normal, calls = _collect_stream(K2V3Detector(), self.tools, list(wire))
+        self.assertEqual(normal, "\n")
         self.assertEqual(calls[0]["name"], "get_weather")
 
     def test_normal_text_after_tool_call_is_buffered(self):
