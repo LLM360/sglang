@@ -104,7 +104,7 @@ class TestK2V3XmlExtraction(unittest.TestCase):
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[0].tool_index, 0)
         self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
-        self.assertEqual(result.normal_text, "")
+        self.assertIsNone(result.normal_text)
 
     def test_schema_typed_value_coercion(self):
         # 'days' is declared integer in the schema -> deserialized to int 3.
@@ -214,8 +214,21 @@ class TestK2V3ReasoningPrefix(unittest.TestCase):
                     "</ifm|tool_call>"
                 )
                 result = self.det.detect_and_parse(text, self.tools)
-                self.assertEqual(result.normal_text, "")
+                self.assertIsNone(result.normal_text)
                 self.assertEqual(result.calls[0].name, "get_weather")
+
+    def test_stripped_ifm_reasoning_prefix_empty_content_returns_none(self):
+        text = (
+            "<ifm|think>need lookup</ifm|think>"
+            "<ifm|tool_calls>"
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
+            "</ifm|tool_call>"
+            "</ifm|tool_calls>"
+        )
+        result = self.det.detect_and_parse(text, self.tools)
+        self.assertIsNone(result.normal_text)
+        self.assertEqual(result.calls[0].name, "get_weather")
 
     def test_legacy_think_prefix_is_not_stripped(self):
         text = (
@@ -243,6 +256,7 @@ class TestK2V3JsonDialect(unittest.TestCase):
         result = self.det.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertIsNone(result.normal_text)
         self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
 
     def test_json_arguments_as_string(self):
@@ -645,7 +659,7 @@ class TestK2V3RegistryWiring(unittest.TestCase):
                 self.assertEqual(parser.detector.tool_format, dialect)
 
                 normal_text, calls = parser.parse_non_stream(wire_output)
-                self.assertEqual(normal_text, "")
+                self.assertIsNone(normal_text)
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(calls[0].name, "get_weather")
                 self.assertEqual(json.loads(calls[0].parameters), {"city": "Tokyo"})
@@ -680,7 +694,7 @@ class TestK2V3RegistryWiring(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].name, "get_weather")
         self.assertEqual(json.loads(calls[0].parameters), {"city": "Tokyo"})
-        self.assertEqual(normal_text, "")
+        self.assertIsNone(normal_text)
 
 
 if __name__ == "__main__":

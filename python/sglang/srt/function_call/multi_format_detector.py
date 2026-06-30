@@ -890,7 +890,7 @@ class MultiFormatDetector(BaseFormatDetector):
             yield name, args
 
     @classmethod
-    def _ifm_prefix(cls, text: str, first_match_index: int) -> str:
+    def _ifm_prefix(cls, text: str, first_match_index: int) -> Optional[str]:
         """Leading content before the tool calls, with IFM reasoning stripped.
 
         vLLM cuts the prefix at the <ifm|tool_calls> wrapper when present,
@@ -901,9 +901,9 @@ class MultiFormatDetector(BaseFormatDetector):
         group_index = text.find(cls._IFM_TOOL_CALLS_START_TOKEN)
         cut = group_index if group_index != -1 else first_match_index
         if cut <= 0:
-            return ""
+            return None
         content = cls._strip_ifm_reasoning_prefix(text[:cut])
-        return content
+        return content if content != "" else None
 
     @classmethod
     def _strip_ifm_reasoning_prefix(cls, content: str) -> str:
