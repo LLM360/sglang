@@ -116,6 +116,25 @@ class TestK2V3XmlExtraction(unittest.TestCase):
         result = self.det.detect_and_parse(text, self.tools)
         self.assertEqual(json.loads(result.calls[0].parameters), {"days": 3})
 
+    def test_schema_string_preserves_argument_whitespace(self):
+        text = (
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>city</ifm|arg_key>"
+            "<ifm|arg_value>\nTokyo\n</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+        result = self.det.detect_and_parse(text, self.tools)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "\nTokyo\n"})
+
+    def test_schema_integer_strips_outer_whitespace_before_coercion(self):
+        text = (
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>days</ifm|arg_key><ifm|arg_value>\n3\n</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+        result = self.det.detect_and_parse(text, self.tools)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"days": 3})
+
     def test_no_args(self):
         text = "<ifm|tool_call>get_weather</ifm|tool_call>"
         result = self.det.detect_and_parse(text, self.tools)
@@ -154,6 +173,32 @@ class TestK2V3XmlTyped(unittest.TestCase):
         )
         result = det.detect_and_parse(text, [_make_tool("study_args")])
         self.assertEqual(json.loads(result.calls[0].parameters), {"user_id": "12345"})
+
+    def test_arg_type_any_preserves_argument_whitespace(self):
+        det = K2V3Detector(tool_format="xml_typed")
+        text = (
+            "<ifm|tool_call>study_args"
+            "<ifm|arg_key>notes</ifm|arg_key>"
+            "<ifm|arg_type>any</ifm|arg_type>"
+            "<ifm|arg_value>\nkeep me\n</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+        result = det.detect_and_parse(text, [_make_tool("study_args")])
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"notes": "\nkeep me\n"}
+        )
+
+    def test_boolean_arg_type_strips_outer_whitespace_before_coercion(self):
+        det = K2V3Detector(tool_format="xml_typed")
+        text = (
+            "<ifm|tool_call>study_args"
+            "<ifm|arg_key>enabled</ifm|arg_key>"
+            "<ifm|arg_type>boolean</ifm|arg_type>"
+            "<ifm|arg_value>\ntrue\n</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+        result = det.detect_and_parse(text, [_make_tool("study_args")])
+        self.assertEqual(json.loads(result.calls[0].parameters), {"enabled": True})
 
 
 class TestK2V3ReasoningPrefix(unittest.TestCase):
@@ -536,6 +581,22 @@ class TestK2V3XmlTypedStreaming(unittest.TestCase):
         self.assertEqual(
             json.loads(calls[0]["parameters"]),
             json.loads(nonstream.calls[0].parameters),
+        )
+
+    def test_inline_any_preserves_argument_whitespace(self):
+        det = K2V3Detector(tool_format="xml_typed")
+        tools = [_make_tool("study_args")]
+        block = (
+            "<ifm|tool_call>study_args"
+            "<ifm|arg_key>notes</ifm|arg_key>"
+            "<ifm|arg_type>any</ifm|arg_type>"
+            "<ifm|arg_value>\nkeep me\n</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+        normal, calls = _collect_stream(det, tools, list(block))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            json.loads(calls[0]["parameters"]), {"notes": "\nkeep me\n"}
         )
 
 

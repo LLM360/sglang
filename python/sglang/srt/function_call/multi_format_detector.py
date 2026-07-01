@@ -282,7 +282,7 @@ class MultiFormatDetector(BaseFormatDetector):
         "string" (a streaming limitation shared with the GLM detectors, since the
         full value is not yet known when its type must be decided)."""
         target = self._schema_arg_type(func_name, key, tools) or self._ifm_inline_type
-        if self._arg_type_is_string(target):
+        if self._arg_type_preserves_text(target):
             return "string"
         if target in ("number", "integer", "float"):
             return "number"
@@ -863,7 +863,7 @@ class MultiFormatDetector(BaseFormatDetector):
         args = (
             {
                 key.strip(): self._coerce_argument_value(
-                    value.strip(),
+                    value,
                     name,
                     key.strip(),
                     tools,
@@ -941,6 +941,16 @@ class MultiFormatDetector(BaseFormatDetector):
             return "string" in arg_type
         return arg_type == "string"
 
+    @classmethod
+    def _arg_type_preserves_text(cls, arg_type: Any) -> bool:
+        return cls._arg_type_is_string(arg_type) or cls._arg_type_is_any(arg_type)
+
+    @staticmethod
+    def _arg_type_is_any(arg_type: Any) -> bool:
+        if isinstance(arg_type, list):
+            return "any" in arg_type
+        return arg_type == "any"
+
     @staticmethod
     def _json_stringify(value: Any) -> str:
         if isinstance(value, str):
@@ -959,7 +969,9 @@ class MultiFormatDetector(BaseFormatDetector):
         from_text: bool = False,
     ) -> Any:
         target_type = cls._schema_arg_type(tool_name, arg_name, tools) or arg_type
-        if cls._arg_type_is_string(target_type):
+        if cls._arg_type_preserves_text(target_type):
+            if cls._arg_type_is_any(target_type):
+                return value
             return cls._json_stringify(value)
         if isinstance(value, str) and (from_text or target_type is not None):
             return cls._deserialize_glm_value(value)
