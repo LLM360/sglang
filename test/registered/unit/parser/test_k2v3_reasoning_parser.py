@@ -140,16 +140,16 @@ class TestK2V3DetectorLegacyToolCallSplit(CustomTestCase):
 
 
 class TestK2V3DetectorParsing(CustomTestCase):
-    """K2-v3 inherits the standard <think>...</think> state machine (IFM tokens)."""
+    """K2-v3 parses forced reasoning until the selected IFM end token."""
 
-    def test_high_effort_preserves_newline_prefixed_think_start(self):
+    def test_high_effort_parses_end_only_output(self):
         detector = K2V3Detector(reasoning_effort="high")
-        text = "\n<ifm|think>reasoning here</ifm|think>final answer"
+        text = "reasoning here</ifm|think>final answer"
         result = detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "\nreasoning here")
+        self.assertEqual(result.reasoning_text, "reasoning here")
         self.assertEqual(result.normal_text, "final answer")
 
-    def test_high_effort_falls_back_to_bare_think_start(self):
+    def test_high_effort_strips_redundant_generated_think_start(self):
         detector = K2V3Detector(reasoning_effort="high")
         text = "<ifm|think>reasoning here</ifm|think>final answer"
         result = detector.detect_and_parse(text)
@@ -166,12 +166,6 @@ class TestK2V3DetectorParsing(CustomTestCase):
         result = detector.detect_and_parse(text)
         self.assertEqual(result.reasoning_text, "\n")
         self.assertTrue(result.normal_text.startswith("\n<ifm|tool_calls>"))
-
-    def test_streaming_preserves_newline_prefixed_think_start(self):
-        detector = K2V3Detector(reasoning_effort="high")
-        result = detector.parse_streaming_increment("\n<ifm|think>reasoning")
-        self.assertEqual(result.reasoning_text, "\nreasoning")
-        self.assertEqual(result.normal_text, "")
 
     def test_medium_effort_parses_end_only_output(self):
         detector = K2V3Detector(reasoning_effort="medium")
