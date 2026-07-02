@@ -1090,7 +1090,9 @@ class MultiFormatDetector(BaseFormatDetector):
                 target_type=target_type,
             )
         try:
-            return ast.literal_eval(value)
+            result = ast.literal_eval(value)
+            json.dumps(result)
+            return result
         except Exception as ast_error:
             self._on_ast_literal_eval_failed_raw_string(
                 value,
