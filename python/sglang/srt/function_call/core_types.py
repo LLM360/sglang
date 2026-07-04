@@ -15,7 +15,7 @@ class ToolCallItem(BaseModel):
 class StreamingParseResult(BaseModel):
     """Result of streaming incremental parsing."""
 
-    normal_text: str = ""
+    normal_text: Optional[str] = ""
     calls: List[ToolCallItem] = []
 
 

@@ -306,6 +306,137 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(events[0]["phase"], "non_stream")
         self.assertEqual(events[0]["details"]["tool_start_token"], "<ifm|tool_call>")
 
+    def test_k2v3_combined_preserves_reasoning_and_content_newlines(self):
+        self.chat.reasoning_parser = "k2_v3"
+        self.chat.tool_call_parser = "k2_v3"
+        self.template_manager.force_reasoning = False
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"},
+                                "date": {"type": "string"},
+                            },
+                        },
+                    },
+                }
+            ],
+        )
+        ret = [
+            {
+                "text": (
+                    "<ifm|think>\n</ifm|think>\n"
+                    "<ifm|tool_calls>\n"
+                    "<ifm|tool_call>get_weather"
+                    "<ifm|arg_key>location</ifm|arg_key>"
+                    "<ifm|arg_value>Boston, MA</ifm|arg_value>"
+                    "<ifm|arg_key>date</ifm|arg_key>"
+                    "<ifm|arg_value>tomorrow</ifm|arg_value>"
+                    "</ifm|tool_call>\n"
+                    "</ifm|tool_calls>"
+                ),
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 9,
+                    "reasoning_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "test",
+                },
+                "index": 0,
+            }
+        ]
+
+        response = self.chat._build_chat_response(req, ret, created=0)
+
+        choice = response.choices[0]
+        self.assertEqual(choice.message.reasoning_content, "\n")
+        self.assertEqual(choice.message.content, "\n")
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(choice.message.tool_calls[0].function.name, "get_weather")
+        self.assertEqual(
+            json.loads(choice.message.tool_calls[0].function.arguments),
+            {"location": "Boston, MA", "date": "tomorrow"},
+        )
+
+    def test_k2v3_combined_stream_preserves_content_newline(self):
+        self.chat.reasoning_parser = "k2_v3"
+        self.chat.tool_call_parser = "k2_v3"
+        self.template_manager.force_reasoning = False
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"},
+                                "date": {"type": "string"},
+                            },
+                        },
+                    },
+                }
+            ],
+            stream=True,
+        )
+        raw_delta = (
+            "<ifm|think>\n</ifm|think>\n"
+            "<ifm|tool_calls>\n"
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>location</ifm|arg_key>"
+            "<ifm|arg_value>Boston, MA</ifm|arg_value>"
+            "<ifm|arg_key>date</ifm|arg_key>"
+            "<ifm|arg_value>tomorrow</ifm|arg_value>"
+            "</ifm|tool_call>\n"
+            "</ifm|tool_calls>"
+        )
+        content = {"meta_info": {"id": "chatcmpl-test"}}
+        reasoning_text, tool_delta = self.chat._process_reasoning_stream(
+            0, raw_delta, {}, content, req
+        )
+        self.assertEqual(reasoning_text, "\n")
+        self.assertTrue(tool_delta.startswith("\n<ifm|tool_calls>"))
+
+        async def collect_chunks():
+            chunks = []
+            gen = self.chat._process_tool_call_stream(
+                index=0,
+                delta=tool_delta,
+                parser_dict={},
+                content=content,
+                request=req,
+                has_tool_calls={},
+            )
+            async for emitted in gen:
+                chunks.append(emitted)
+            return chunks
+
+        loop = get_or_create_event_loop()
+        chunks = loop.run_until_complete(collect_chunks())
+        payloads = [json.loads(chunk[len("data: ") :]) for chunk in chunks]
+
+        first_delta = payloads[0]["choices"][0]["delta"]
+        self.assertEqual(first_delta.get("content"), "\n")
+        tool_deltas = [
+            payload["choices"][0]["delta"]["tool_calls"]
+            for payload in payloads
+            if payload["choices"][0]["delta"].get("tool_calls")
+        ]
+        self.assertTrue(tool_deltas)
+        self.assertEqual(tool_deltas[0][0]["function"]["name"], "get_weather")
+
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
 
