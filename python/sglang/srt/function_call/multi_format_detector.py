@@ -265,12 +265,12 @@ class MultiFormatDetector(BaseFormatDetector):
             return text, ""
         return text[:cut], text[cut:]
 
-    def _ifm_prefix_normal_text(self, prefix: str) -> str:
+    def _ifm_prefix_normal_text(self, prefix: str) -> Optional[str]:
         """Normal text from the segment before the first ``<ifm|tool_call>`` in
-        the same chunk: reasoning/wrapper stripped, whitespace-only collapsed to
-        "" (matching the non-stream ``_ifm_prefix`` semantics)."""
+        the same chunk: reasoning/wrapper stripped while preserving genuine
+        whitespace content."""
         emit, _ = self._ifm_split_normal_text(prefix)
-        return emit if emit.strip() else ""
+        return emit if emit != "" else None
 
     def _ifm_stream_value_type(
         self, func_name: str, key: str, tools: List[Tool]
@@ -282,7 +282,7 @@ class MultiFormatDetector(BaseFormatDetector):
         "string" (a streaming limitation shared with the GLM detectors, since the
         full value is not yet known when its type must be decided)."""
         target = self._schema_arg_type(func_name, key, tools) or self._ifm_inline_type
-        if self._arg_type_is_string(target):
+        if self._arg_type_preserves_text(target):
             return "string"
         if target in ("number", "integer", "float"):
             return "number"
@@ -445,9 +445,11 @@ class MultiFormatDetector(BaseFormatDetector):
                     if calls:
                         self._buffer = current_text
                         break
-                    normal_text += self._ifm_prefix_normal_text(
+                    prefix_normal_text = self._ifm_prefix_normal_text(
                         current_text[:first_idx]
                     )
+                    if prefix_normal_text is not None:
+                        normal_text += prefix_normal_text
                     current_text = current_text[first_idx:]
 
                 partial_match = self._IFM_STREAM_TOOL_CALL_REGEX.search(current_text)
@@ -629,7 +631,9 @@ class MultiFormatDetector(BaseFormatDetector):
         normal_text = ""
         first_idx = current_text.find(start_token)
         if first_idx > 0:
-            normal_text = self._ifm_prefix_normal_text(current_text[:first_idx])
+            prefix_normal_text = self._ifm_prefix_normal_text(current_text[:first_idx])
+            if prefix_normal_text is not None:
+                normal_text = prefix_normal_text
             current_text = current_text[first_idx:]
 
         if self.current_tool_id == -1:
@@ -859,7 +863,7 @@ class MultiFormatDetector(BaseFormatDetector):
         args = (
             {
                 key.strip(): self._coerce_argument_value(
-                    value.strip(),
+                    value,
                     name,
                     key.strip(),
                     tools,
@@ -886,20 +890,20 @@ class MultiFormatDetector(BaseFormatDetector):
             yield name, args
 
     @classmethod
-    def _ifm_prefix(cls, text: str, first_match_index: int) -> str:
+    def _ifm_prefix(cls, text: str, first_match_index: int) -> Optional[str]:
         """Leading content before the tool calls, with IFM reasoning stripped.
 
         vLLM cuts the prefix at the <ifm|tool_calls> wrapper when present,
         else at the first <ifm|tool_call> block, then strips any leading
-        reasoning-effort block. Returns "" when nothing remains (vLLM uses
-        None for the same case).
+        reasoning-effort block. Whitespace-only content before the tool call is
+        preserved.
         """
         group_index = text.find(cls._IFM_TOOL_CALLS_START_TOKEN)
         cut = group_index if group_index != -1 else first_match_index
         if cut <= 0:
-            return ""
+            return None
         content = cls._strip_ifm_reasoning_prefix(text[:cut])
-        return content if content.strip() else ""
+        return content if content != "" else None
 
     @classmethod
     def _strip_ifm_reasoning_prefix(cls, content: str) -> str:
@@ -937,6 +941,16 @@ class MultiFormatDetector(BaseFormatDetector):
             return "string" in arg_type
         return arg_type == "string"
 
+    @classmethod
+    def _arg_type_preserves_text(cls, arg_type: Any) -> bool:
+        return cls._arg_type_is_string(arg_type) or cls._arg_type_is_any(arg_type)
+
+    @staticmethod
+    def _arg_type_is_any(arg_type: Any) -> bool:
+        if isinstance(arg_type, list):
+            return "any" in arg_type
+        return arg_type == "any"
+
     @staticmethod
     def _json_stringify(value: Any) -> str:
         if isinstance(value, str):
@@ -955,7 +969,9 @@ class MultiFormatDetector(BaseFormatDetector):
         from_text: bool = False,
     ) -> Any:
         target_type = cls._schema_arg_type(tool_name, arg_name, tools) or arg_type
-        if cls._arg_type_is_string(target_type):
+        if cls._arg_type_preserves_text(target_type):
+            if cls._arg_type_is_any(target_type):
+                return value
             return cls._json_stringify(value)
         if isinstance(value, str) and (from_text or target_type is not None):
             return cls._deserialize_glm_value(value)
@@ -991,7 +1007,7 @@ class MultiFormatDetector(BaseFormatDetector):
         r"<ifm\|think>.*?</ifm\|think>|"
         r"<ifm\|think_fast>.*?</ifm\|think_fast>|"
         r"<ifm\|think_faster>.*?</ifm\|think_faster>"
-        r")\s*",
+        r")",
         re.DOTALL,
     )
 

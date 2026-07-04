@@ -116,7 +116,9 @@ class FunctionCallParser:
             return False
         return self.detector.has_tool_call(text)
 
-    def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
+    def parse_non_stream(
+        self, full_text: str
+    ) -> Tuple[Optional[str], list[ToolCallItem]]:
         """
         One-time parsing of the full text to extract tool calls.
 

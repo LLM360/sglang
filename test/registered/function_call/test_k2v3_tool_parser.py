@@ -104,13 +104,32 @@ class TestK2V3XmlExtraction(unittest.TestCase):
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[0].tool_index, 0)
         self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
-        self.assertEqual(result.normal_text, "")
+        self.assertIsNone(result.normal_text)
 
     def test_schema_typed_value_coercion(self):
         # 'days' is declared integer in the schema -> deserialized to int 3.
         text = (
             "<ifm|tool_call>get_weather"
             "<ifm|arg_key>days</ifm|arg_key><ifm|arg_value>3</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+        result = self.det.detect_and_parse(text, self.tools)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"days": 3})
+
+    def test_schema_string_preserves_argument_whitespace(self):
+        text = (
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>city</ifm|arg_key>"
+            "<ifm|arg_value>\nTokyo\n</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+        result = self.det.detect_and_parse(text, self.tools)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "\nTokyo\n"})
+
+    def test_schema_integer_strips_outer_whitespace_before_coercion(self):
+        text = (
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>days</ifm|arg_key><ifm|arg_value>\n3\n</ifm|arg_value>"
             "</ifm|tool_call>"
         )
         result = self.det.detect_and_parse(text, self.tools)
@@ -155,6 +174,32 @@ class TestK2V3XmlTyped(unittest.TestCase):
         result = det.detect_and_parse(text, [_make_tool("study_args")])
         self.assertEqual(json.loads(result.calls[0].parameters), {"user_id": "12345"})
 
+    def test_arg_type_any_preserves_argument_whitespace(self):
+        det = K2V3Detector(tool_format="xml_typed")
+        text = (
+            "<ifm|tool_call>study_args"
+            "<ifm|arg_key>notes</ifm|arg_key>"
+            "<ifm|arg_type>any</ifm|arg_type>"
+            "<ifm|arg_value>\nkeep me\n</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+        result = det.detect_and_parse(text, [_make_tool("study_args")])
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"notes": "\nkeep me\n"}
+        )
+
+    def test_boolean_arg_type_strips_outer_whitespace_before_coercion(self):
+        det = K2V3Detector(tool_format="xml_typed")
+        text = (
+            "<ifm|tool_call>study_args"
+            "<ifm|arg_key>enabled</ifm|arg_key>"
+            "<ifm|arg_type>boolean</ifm|arg_type>"
+            "<ifm|arg_value>\ntrue\n</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+        result = det.detect_and_parse(text, [_make_tool("study_args")])
+        self.assertEqual(json.loads(result.calls[0].parameters), {"enabled": True})
+
 
 class TestK2V3ReasoningPrefix(unittest.TestCase):
     def setUp(self):
@@ -171,7 +216,35 @@ class TestK2V3ReasoningPrefix(unittest.TestCase):
             "</ifm|tool_calls>"
         )
         result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.normal_text, "\n")
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
+
+    def test_tool_only_preserves_newline_after_reasoning_prefix(self):
+        text = (
+            "<ifm|think>\n</ifm|think>\n"
+            "<ifm|tool_calls>\n"
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
+            "</ifm|tool_call>\n"
+            "</ifm|tool_calls>"
+        )
+        result = self.det.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "\n")
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
+
+    def test_tool_only_preserves_whitespace_prefix_before_tool_calls(self):
+        text = (
+            "\n"
+            "<ifm|tool_calls>\n"
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
+            "</ifm|tool_call>\n"
+            "</ifm|tool_calls>"
+        )
+        result = self.det.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "\n")
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
 
@@ -186,8 +259,21 @@ class TestK2V3ReasoningPrefix(unittest.TestCase):
                     "</ifm|tool_call>"
                 )
                 result = self.det.detect_and_parse(text, self.tools)
-                self.assertEqual(result.normal_text, "")
+                self.assertIsNone(result.normal_text)
                 self.assertEqual(result.calls[0].name, "get_weather")
+
+    def test_stripped_ifm_reasoning_prefix_empty_content_returns_none(self):
+        text = (
+            "<ifm|think>need lookup</ifm|think>"
+            "<ifm|tool_calls>"
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
+            "</ifm|tool_call>"
+            "</ifm|tool_calls>"
+        )
+        result = self.det.detect_and_parse(text, self.tools)
+        self.assertIsNone(result.normal_text)
+        self.assertEqual(result.calls[0].name, "get_weather")
 
     def test_legacy_think_prefix_is_not_stripped(self):
         text = (
@@ -215,6 +301,7 @@ class TestK2V3JsonDialect(unittest.TestCase):
         result = self.det.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertIsNone(result.normal_text)
         self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
 
     def test_json_arguments_as_string(self):
@@ -427,6 +514,12 @@ class TestK2V3XmlStreaming(unittest.TestCase):
         self.assertEqual(normal, "Sure, let me check.")
         self.assertEqual(calls[0]["name"], "get_weather")
 
+    def test_whitespace_before_tool_call_is_emitted(self):
+        wire = "\n<ifm|tool_call>get_weather</ifm|tool_call>"
+        normal, calls = _collect_stream(K2V3Detector(), self.tools, list(wire))
+        self.assertEqual(normal, "\n")
+        self.assertEqual(calls[0]["name"], "get_weather")
+
     def test_normal_text_after_tool_call_is_buffered(self):
         det = K2V3Detector()
         first = det.parse_streaming_increment(
@@ -488,6 +581,22 @@ class TestK2V3XmlTypedStreaming(unittest.TestCase):
         self.assertEqual(
             json.loads(calls[0]["parameters"]),
             json.loads(nonstream.calls[0].parameters),
+        )
+
+    def test_inline_any_preserves_argument_whitespace(self):
+        det = K2V3Detector(tool_format="xml_typed")
+        tools = [_make_tool("study_args")]
+        block = (
+            "<ifm|tool_call>study_args"
+            "<ifm|arg_key>notes</ifm|arg_key>"
+            "<ifm|arg_type>any</ifm|arg_type>"
+            "<ifm|arg_value>\nkeep me\n</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+        normal, calls = _collect_stream(det, tools, list(block))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            json.loads(calls[0]["parameters"]), {"notes": "\nkeep me\n"}
         )
 
 
@@ -611,7 +720,7 @@ class TestK2V3RegistryWiring(unittest.TestCase):
                 self.assertEqual(parser.detector.tool_format, dialect)
 
                 normal_text, calls = parser.parse_non_stream(wire_output)
-                self.assertEqual(normal_text, "")
+                self.assertIsNone(normal_text)
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(calls[0].name, "get_weather")
                 self.assertEqual(json.loads(calls[0].parameters), {"city": "Tokyo"})
@@ -646,7 +755,7 @@ class TestK2V3RegistryWiring(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].name, "get_weather")
         self.assertEqual(json.loads(calls[0].parameters), {"city": "Tokyo"})
-        self.assertEqual(normal_text, "")
+        self.assertIsNone(normal_text)
 
 
 if __name__ == "__main__":
