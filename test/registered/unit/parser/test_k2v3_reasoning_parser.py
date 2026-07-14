@@ -119,15 +119,52 @@ class TestK2V3DetectorToolCallSplit(CustomTestCase):
 class TestK2V3DetectorTracking(CustomTestCase):
     """The opt-in K2-v3 tracking parser records selected fallback paths."""
 
+    def _assert_parse_equal(self, text, *, effort="high", **kwargs):
+        base = K2V3Detector(reasoning_effort=effort, **kwargs)
+        tracked = K2V3DetectorTracking(reasoning_effort=effort, **kwargs)
+        base_result = base.detect_and_parse(text)
+        tracked_result = tracked.detect_and_parse(text)
+        self.assertEqual(tracked_result.reasoning_text, base_result.reasoning_text)
+        self.assertEqual(tracked_result.normal_text, base_result.normal_text)
+        return tracked, tracked_result
+
+    def _assert_stream_equal(self, chunks, *, effort="high", **kwargs):
+        base = K2V3Detector(reasoning_effort=effort, **kwargs)
+        tracked = K2V3DetectorTracking(reasoning_effort=effort, **kwargs)
+        for chunk in chunks:
+            with self.subTest(effort=effort, chunk=chunk):
+                base_result = base.parse_streaming_increment(chunk)
+                tracked_result = tracked.parse_streaming_increment(chunk)
+                self.assertEqual(
+                    tracked_result.reasoning_text, base_result.reasoning_text
+                )
+                self.assertEqual(tracked_result.normal_text, base_result.normal_text)
+        self.assertEqual(tracked.fallback_events, [])
+
+    def test_output_matches_base_detector_for_all_efforts(self):
+        for effort in ["high", "medium", "low"]:
+            base = K2V3Detector(reasoning_effort=effort)
+            cases = [
+                "reasoning" + base.think_end_token + "final",
+                (
+                    "I'll check the file.\n"
+                    "<ifm|tool_call>read<ifm|arg_key>filePath</ifm|arg_key>"
+                    "<ifm|arg_value>/tmp/f</ifm|arg_value></ifm|tool_call>"
+                ),
+                base.think_start_token + "reasoning" + base.think_end_token + "final",
+            ]
+            for text in cases:
+                with self.subTest(effort=effort, text=text):
+                    self._assert_parse_equal(text, effort=effort)
+
     def test_tool_start_token_fallback_event_is_recorded(self):
-        detector = K2V3DetectorTracking(reasoning_effort="high")
         text = (
             "I'll check the file.\n"
             "<ifm|tool_call>read<ifm|arg_key>filePath</ifm|arg_key>"
             "<ifm|arg_value>/tmp/f</ifm|arg_value></ifm|tool_call>"
         )
 
-        result = detector.detect_and_parse(text)
+        detector, result = self._assert_parse_equal(text, effort="high")
 
         self.assertEqual(result.reasoning_text, "I'll check the file.\n")
         self.assertTrue(result.normal_text.startswith("<ifm|tool_call>"))
@@ -139,18 +176,39 @@ class TestK2V3DetectorTracking(CustomTestCase):
         self.assertEqual(event["details"]["tool_start_token"], "<ifm|tool_call>")
 
     def test_no_event_when_think_end_token_is_present(self):
-        detector = K2V3DetectorTracking(reasoning_effort="high")
-
-        detector.detect_and_parse("reasoning</ifm|think>final")
+        detector, _ = self._assert_parse_equal(
+            "reasoning</ifm|think>final", effort="high"
+        )
 
         self.assertEqual(detector.fallback_events, [])
 
     def test_streaming_events_are_not_tracked(self):
+        for effort in ["high", "medium", "low"]:
+            self._assert_stream_equal(
+                ["reasoning", "<ifm|tool_call>read</ifm|tool_call>"],
+                effort=effort,
+            )
+
+    def test_reused_detector_clears_events_on_non_stream_parse(self):
         detector = K2V3DetectorTracking(reasoning_effort="high")
+        detector.detect_and_parse("reasoning<ifm|tool_call>read</ifm|tool_call>")
+        self.assertTrue(detector.fallback_events)
+        detector.detect_and_parse("reasoning</ifm|think>final")
 
-        detector.parse_streaming_increment("reasoning")
-        detector.parse_streaming_increment("<ifm|tool_call>read</ifm|tool_call>")
+        self.assertEqual(detector.fallback_events, [])
 
+    def test_continue_final_message_with_previous_end_token_matches_base(self):
+        base = K2V3Detector(reasoning_effort="high")
+        previous_content = "already closed" + base.think_end_token
+
+        detector, result = self._assert_parse_equal(
+            "continued final",
+            effort="high",
+            continue_final_message=True,
+            previous_content=previous_content,
+        )
+
+        self.assertEqual(result.normal_text, "continued final")
         self.assertEqual(detector.fallback_events, [])
 
 

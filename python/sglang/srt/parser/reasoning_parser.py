@@ -51,6 +51,15 @@ class BaseReasoningFormatDetector:
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
 
+    def _on_tool_start_token_fallback(
+        self,
+        *,
+        tool_idx: int,
+        reasoning_text: str,
+        normal_text: str,
+    ) -> None:
+        pass
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses reasoning sections in the provided text.
@@ -79,6 +88,11 @@ class BaseReasoningFormatDetector:
                 reasoning_text = processed_text[:tool_idx]
                 # Preserve tool_start_token in normal text
                 normal_text = processed_text[tool_idx:]
+                self._on_tool_start_token_fallback(
+                    tool_idx=tool_idx,
+                    reasoning_text=reasoning_text,
+                    normal_text=normal_text,
+                )
                 return StreamingParseResult(
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
@@ -583,26 +597,24 @@ class K2V3DetectorTracking(K2V3Detector):
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         self.clear_fallback_events()
-        in_reasoning = self._in_reasoning or self.think_start_token in text
-        processed_text = text.replace(self.think_start_token, "")
-        if (
-            in_reasoning
-            and self.tool_start_token is not None
-            and self.tool_start_token in processed_text
-            and self.think_end_token not in processed_text
-            and self.think_end_token not in self.previous_content
-        ):
-            tool_idx = processed_text.find(self.tool_start_token)
-            self._record_fallback(
-                "tool_start_token_fallback",
-                "non_stream",
-                think_end_token=self.think_end_token,
-                tool_start_token=self.tool_start_token,
-                tool_start_index=tool_idx,
-                reasoning_preview=self._preview_value(processed_text[:tool_idx]),
-                normal_text_preview=self._preview_value(processed_text[tool_idx:]),
-            )
         return super().detect_and_parse(text)
+
+    def _on_tool_start_token_fallback(
+        self,
+        *,
+        tool_idx: int,
+        reasoning_text: str,
+        normal_text: str,
+    ) -> None:
+        self._record_fallback(
+            "tool_start_token_fallback",
+            "non_stream",
+            think_end_token=self.think_end_token,
+            tool_start_token=self.tool_start_token,
+            tool_start_index=tool_idx,
+            reasoning_preview=self._preview_value(reasoning_text),
+            normal_text_preview=self._preview_value(normal_text),
+        )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         previous = self._suppress_fallback_tracking

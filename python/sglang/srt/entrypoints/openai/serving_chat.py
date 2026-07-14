@@ -1066,9 +1066,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         request=request,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
-                    self._attach_reasoning_parser_fallback_events(
-                        ret_item["meta_info"], parser
-                    )
+                    if request.return_meta_info:
+                        self._attach_reasoning_parser_fallback_events(
+                            ret_item["meta_info"], parser
+                        )
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -1092,7 +1093,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     history_tool_calls_cnt,
                     chat_template_kwargs=getattr(request, "chat_template_kwargs", None),
-                    meta_info=ret_item["meta_info"],
+                    meta_info=(
+                        ret_item["meta_info"] if request.return_meta_info else None
+                    ),
                 )
 
             # Strip structural special tokens that leaked through because

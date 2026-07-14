@@ -365,6 +365,8 @@ class TestK2V3DetectorTracking(unittest.TestCase):
                         "city": {"type": "string"},
                         "flag": {"type": "boolean"},
                         "payload": {"type": "object"},
+                        "days": {"type": "integer"},
+                        "notes": {"type": "any"},
                         "user_id": {"type": "string"},
                     },
                 },
@@ -375,44 +377,194 @@ class TestK2V3DetectorTracking(unittest.TestCase):
     def _call_tuple(call):
         return call.tool_index, call.name, call.parameters
 
-    def test_output_matches_base_detector_for_supported_dialects(self):
-        cases = {
-            "xml": (
+    def _assert_parse_equal(self, text, *, dialect="xml", tools=None):
+        tools = tools or self.tools
+        base = K2V3Detector(tool_format=dialect).detect_and_parse(text, tools)
+        tracked_detector = K2V3DetectorTracking(tool_format=dialect)
+        tracked = tracked_detector.detect_and_parse(text, tools)
+
+        self.assertEqual(tracked.normal_text, base.normal_text)
+        self.assertEqual(len(tracked.calls), len(base.calls))
+        self.assertEqual(
+            [self._call_tuple(call) for call in tracked.calls],
+            [self._call_tuple(call) for call in base.calls],
+        )
+        return tracked_detector, tracked
+
+    def _assert_stream_equal(self, chunks, *, dialect="xml", tools=None):
+        tools = tools or self.tools
+        base = K2V3Detector(tool_format=dialect)
+        tracked = K2V3DetectorTracking(tool_format=dialect)
+        for chunk in chunks:
+            with self.subTest(dialect=dialect, chunk=chunk):
+                base_result = base.parse_streaming_increment(chunk, tools)
+                tracked_result = tracked.parse_streaming_increment(chunk, tools)
+                self.assertEqual(tracked_result.normal_text, base_result.normal_text)
+                self.assertEqual(
+                    [self._call_tuple(call) for call in tracked_result.calls],
+                    [self._call_tuple(call) for call in base_result.calls],
+                )
+        self.assertEqual(tracked.fallback_events, [])
+
+    def test_non_stream_output_matches_base_detector(self):
+        cases = [
+            (
+                "direct_xml",
+                "xml",
+                "<ifm|tool_call>study_args"
+                "<ifm|arg_key>city</ifm|arg_key>"
+                "<ifm|arg_value>Tokyo</ifm|arg_value>"
+                "</ifm|tool_call>",
+            ),
+            ("xml_no_args", "xml", "<ifm|tool_call>study_args</ifm|tool_call>"),
+            ("unknown_tool", "xml", "<ifm|tool_call>unknown</ifm|tool_call>"),
+            (
+                "ordinary_prefix",
+                "xml",
+                "Sure.<ifm|tool_call>study_args</ifm|tool_call>",
+            ),
+            (
+                "whitespace_prefix",
+                "xml",
+                "\n<ifm|tool_call>study_args</ifm|tool_call>",
+            ),
+            (
+                "ifm_reasoning_no_residue",
+                "xml",
+                "<ifm|think>need lookup</ifm|think>"
+                "<ifm|tool_call>study_args</ifm|tool_call>",
+            ),
+            (
+                "ifm_reasoning_newline_residue",
+                "xml",
+                "<ifm|think>need lookup</ifm|think>\n"
+                "<ifm|tool_call>study_args</ifm|tool_call>",
+            ),
+            (
+                "wrapper",
+                "xml",
+                "<ifm|tool_calls>\n"
+                "<ifm|tool_call>study_args</ifm|tool_call>"
+                "</ifm|tool_calls>",
+            ),
+            (
+                "multiple_xml_calls",
+                "xml",
                 "<ifm|tool_call>study_args"
                 "<ifm|arg_key>city</ifm|arg_key>"
                 "<ifm|arg_value>Tokyo</ifm|arg_value>"
                 "</ifm|tool_call>"
+                "<ifm|tool_call>study_args"
+                "<ifm|arg_key>city</ifm|arg_key>"
+                "<ifm|arg_value>Osaka</ifm|arg_value>"
+                "</ifm|tool_call>",
             ),
-            "xml_typed": (
+            (
+                "schema_string_whitespace",
+                "xml",
+                "<ifm|tool_call>study_args"
+                "<ifm|arg_key>city</ifm|arg_key>"
+                "<ifm|arg_value>\nTokyo\n</ifm|arg_value>"
+                "</ifm|tool_call>",
+            ),
+            (
+                "schema_integer",
+                "xml",
+                "<ifm|tool_call>study_args"
+                "<ifm|arg_key>days</ifm|arg_key>"
+                "<ifm|arg_value>3</ifm|arg_value>"
+                "</ifm|tool_call>",
+            ),
+            (
+                "schema_boolean_true",
+                "xml",
+                "<ifm|tool_call>study_args"
+                "<ifm|arg_key>flag</ifm|arg_key>"
+                "<ifm|arg_value>True</ifm|arg_value>"
+                "</ifm|tool_call>",
+            ),
+            (
+                "raw_string_fallback",
+                "xml",
+                "<ifm|tool_call>study_args"
+                "<ifm|arg_key>payload</ifm|arg_key>"
+                "<ifm|arg_value>abc</ifm|arg_value>"
+                "</ifm|tool_call>",
+            ),
+            (
+                "python_literal_current_behavior",
+                "xml",
+                "<ifm|tool_call>study_args"
+                "<ifm|arg_key>payload</ifm|arg_key>"
+                "<ifm|arg_value>{1, 2}</ifm|arg_value>"
+                "</ifm|tool_call>",
+            ),
+            (
+                "xml_typed_string",
+                "xml_typed",
                 "<ifm|tool_call>study_args"
                 "<ifm|arg_key>user_id</ifm|arg_key>"
                 "<ifm|arg_type>string</ifm|arg_type>"
                 "<ifm|arg_value>12345</ifm|arg_value>"
-                "</ifm|tool_call>"
+                "</ifm|tool_call>",
             ),
-            "json": (
+            (
+                "xml_typed_any_whitespace",
+                "xml_typed",
+                "<ifm|tool_call>study_args"
+                "<ifm|arg_key>notes</ifm|arg_key>"
+                "<ifm|arg_type>any</ifm|arg_type>"
+                "<ifm|arg_value>\nkeep me\n</ifm|arg_value>"
+                "</ifm|tool_call>",
+            ),
+            (
+                "xml_typed_boolean",
+                "xml_typed",
+                "<ifm|tool_call>study_args"
+                "<ifm|arg_key>flag</ifm|arg_key>"
+                "<ifm|arg_type>boolean</ifm|arg_type>"
+                "<ifm|arg_value>True</ifm|arg_value>"
+                "</ifm|tool_call>",
+            ),
+            (
+                "schema_wins_over_inline",
+                "xml_typed",
+                "<ifm|tool_call>study_args"
+                "<ifm|arg_key>days</ifm|arg_key>"
+                "<ifm|arg_type>string</ifm|arg_type>"
+                "<ifm|arg_value>3</ifm|arg_value>"
+                "</ifm|tool_call>",
+            ),
+            (
+                "json_object_args",
+                "json",
                 "<ifm|tool_call>"
                 '{"name": "study_args", "arguments": {"city": "Tokyo"}}'
-                "</ifm|tool_call>"
+                "</ifm|tool_call>",
             ),
-        }
+            (
+                "json_string_args",
+                "json",
+                "<ifm|tool_call>"
+                '{"name": "study_args", "arguments": "{\\"city\\": \\"Tokyo\\"}"}'
+                "</ifm|tool_call>",
+            ),
+            (
+                "json_call_list",
+                "json",
+                "<ifm|tool_call>"
+                '[{"name": "study_args", "arguments": {"city": "Tokyo"}},'
+                ' {"name": "study_args", "arguments": {"city": "Osaka"}}]'
+                "</ifm|tool_call>",
+            ),
+            ("no_tool_call_text", "xml", "No tool call here."),
+        ]
 
-        for dialect, text in cases.items():
-            with self.subTest(dialect=dialect):
-                base = K2V3Detector(tool_format=dialect).detect_and_parse(
-                    text, self.tools
-                )
-                tracked_detector = K2V3DetectorTracking(tool_format=dialect)
-                tracked = tracked_detector.detect_and_parse(text, self.tools)
-
-                self.assertEqual(tracked.normal_text, base.normal_text)
-                self.assertEqual(
-                    [self._call_tuple(call) for call in tracked.calls],
-                    [self._call_tuple(call) for call in base.calls],
-                )
+        for name, dialect, text in cases:
+            with self.subTest(name=name, dialect=dialect):
+                self._assert_parse_equal(text, dialect=dialect)
 
     def test_tracks_json_failure_before_ast_literal_eval(self):
-        detector = K2V3DetectorTracking()
         text = (
             "<ifm|tool_call>study_args"
             "<ifm|arg_key>flag</ifm|arg_key>"
@@ -420,7 +572,7 @@ class TestK2V3DetectorTracking(unittest.TestCase):
             "</ifm|tool_call>"
         )
 
-        result = detector.detect_and_parse(text, self.tools)
+        detector, result = self._assert_parse_equal(text)
 
         self.assertEqual(json.loads(result.calls[0].parameters), {"flag": True})
         self.assertEqual(
@@ -429,7 +581,6 @@ class TestK2V3DetectorTracking(unittest.TestCase):
         self.assertEqual(detector.fallback_events[0]["phase"], "coercion")
 
     def test_tracks_raw_string_after_json_and_ast_fail(self):
-        detector = K2V3DetectorTracking()
         text = (
             "<ifm|tool_call>study_args"
             "<ifm|arg_key>payload</ifm|arg_key>"
@@ -437,7 +588,7 @@ class TestK2V3DetectorTracking(unittest.TestCase):
             "</ifm|tool_call>"
         )
 
-        result = detector.detect_and_parse(text, self.tools)
+        detector, result = self._assert_parse_equal(text)
 
         self.assertEqual(json.loads(result.calls[0].parameters), {"payload": "abc"})
         self.assertEqual(
@@ -449,7 +600,6 @@ class TestK2V3DetectorTracking(unittest.TestCase):
         )
 
     def test_string_schema_does_not_track_deserialization_fallbacks(self):
-        detector = K2V3DetectorTracking()
         text = (
             "<ifm|tool_call>study_args"
             "<ifm|arg_key>user_id</ifm|arg_key>"
@@ -457,7 +607,7 @@ class TestK2V3DetectorTracking(unittest.TestCase):
             "</ifm|tool_call>"
         )
 
-        result = detector.detect_and_parse(text, self.tools)
+        detector, result = self._assert_parse_equal(text)
 
         self.assertEqual(
             json.loads(result.calls[0].parameters), {"user_id": "12345"}
@@ -465,20 +615,56 @@ class TestK2V3DetectorTracking(unittest.TestCase):
         self.assertEqual(detector.fallback_events, [])
 
     def test_tracks_ifm_reasoning_prefix_stripped(self):
-        detector = K2V3DetectorTracking()
+        cases = [
+            (
+                "<ifm|think>need lookup</ifm|think>"
+                "<ifm|tool_call>study_args</ifm|tool_call>"
+            ),
+            (
+                "<ifm|think>need lookup</ifm|think>\n"
+                "<ifm|tool_call>study_args</ifm|tool_call>"
+            ),
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                detector, _ = self._assert_parse_equal(text)
+                self.assertEqual(
+                    _event_types(detector), ["ifm_reasoning_prefix_stripped"]
+                )
+                self.assertEqual(detector.fallback_events[0]["phase"], "non_stream")
+
+    def test_clean_parse_does_not_track_events(self):
         text = (
-            "<ifm|think>need lookup</ifm|think>\n"
             "<ifm|tool_call>study_args"
             "<ifm|arg_key>city</ifm|arg_key>"
             "<ifm|arg_value>Tokyo</ifm|arg_value>"
             "</ifm|tool_call>"
         )
 
-        result = detector.detect_and_parse(text, self.tools)
+        detector, _ = self._assert_parse_equal(text)
 
-        self.assertEqual(result.normal_text, "")
-        self.assertEqual(_event_types(detector), ["ifm_reasoning_prefix_stripped"])
-        self.assertEqual(detector.fallback_events[0]["phase"], "non_stream")
+        self.assertEqual(detector.fallback_events, [])
+
+    def test_reused_detector_clears_events_on_non_stream_parse(self):
+        detector = K2V3DetectorTracking()
+        fallback_text = (
+            "<ifm|tool_call>study_args"
+            "<ifm|arg_key>payload</ifm|arg_key>"
+            "<ifm|arg_value>abc</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+        clean_text = (
+            "<ifm|tool_call>study_args"
+            "<ifm|arg_key>city</ifm|arg_key>"
+            "<ifm|arg_value>Tokyo</ifm|arg_value>"
+            "</ifm|tool_call>"
+        )
+
+        detector.detect_and_parse(fallback_text, self.tools)
+        self.assertTrue(detector.fallback_events)
+        detector.detect_and_parse(clean_text, self.tools)
+
+        self.assertEqual(detector.fallback_events, [])
 
     def test_clear_fallback_events(self):
         detector = K2V3DetectorTracking()
@@ -488,24 +674,65 @@ class TestK2V3DetectorTracking(unittest.TestCase):
 
         self.assertEqual(detector.fallback_events, [])
 
-    def test_streaming_does_not_record_fallback_events(self):
-        detector = K2V3DetectorTracking()
-        wire = (
-            "<ifm|think>need lookup</ifm|think>\n"
-            "<ifm|tool_calls>\n"
-            "<ifm|tool_call>study_args"
-            "<ifm|arg_key>city</ifm|arg_key>"
-            "<ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>\n"
-            "</ifm|tool_calls>"
-        )
-
-        normal, calls = _collect_stream(detector, self.tools, list(wire))
-
-        self.assertEqual(normal.strip(), "")
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(json.loads(calls[0]["parameters"]), {"city": "Tokyo"})
-        self.assertEqual(detector.fallback_events, [])
+    def test_streaming_output_matches_base_detector_without_events(self):
+        cases = [
+            (
+                "xml_boolean_true",
+                "xml",
+                list(
+                    "<ifm|tool_call>study_args"
+                    "<ifm|arg_key>flag</ifm|arg_key>"
+                    "<ifm|arg_value>True</ifm|arg_value>"
+                    "</ifm|tool_call>"
+                ),
+            ),
+            (
+                "xml_raw_string_payload",
+                "xml",
+                list(
+                    "<ifm|tool_call>study_args"
+                    "<ifm|arg_key>payload</ifm|arg_key>"
+                    "<ifm|arg_value>abc</ifm|arg_value>"
+                    "</ifm|tool_call>"
+                ),
+            ),
+            (
+                "xml_typed_any_whitespace",
+                "xml_typed",
+                list(
+                    "<ifm|tool_call>study_args"
+                    "<ifm|arg_key>notes</ifm|arg_key>"
+                    "<ifm|arg_type>any</ifm|arg_type>"
+                    "<ifm|arg_value>\nkeep me\n</ifm|arg_value>"
+                    "</ifm|tool_call>"
+                ),
+            ),
+            (
+                "json_streaming",
+                "json",
+                list(
+                    "<ifm|tool_call>"
+                    '{"name": "study_args", "arguments": {"city": "Tokyo"}}'
+                    "</ifm|tool_call>"
+                ),
+            ),
+            (
+                "reasoning_prefix_wrapper",
+                "xml",
+                list(
+                    "<ifm|think>need lookup</ifm|think>\n"
+                    "<ifm|tool_calls>\n"
+                    "<ifm|tool_call>study_args"
+                    "<ifm|arg_key>city</ifm|arg_key>"
+                    "<ifm|arg_value>Tokyo</ifm|arg_value>"
+                    "</ifm|tool_call>\n"
+                    "</ifm|tool_calls>"
+                ),
+            ),
+        ]
+        for name, dialect, chunks in cases:
+            with self.subTest(name=name, dialect=dialect):
+                self._assert_stream_equal(chunks, dialect=dialect)
 
 
 class TestK2V3XmlStreaming(unittest.TestCase):

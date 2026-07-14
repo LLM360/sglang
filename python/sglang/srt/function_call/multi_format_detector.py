@@ -180,6 +180,31 @@ class MultiFormatDetector(BaseFormatDetector):
         self._buffer += new_text
         return StreamingParseResult()
 
+    def _on_json_loads_failed_before_ast(
+        self,
+        value: str,
+        error: Exception,
+        *,
+        tool_name: Optional[str] = None,
+        arg_name: Optional[str] = None,
+        target_type: Any = None,
+    ) -> None:
+        pass
+
+    def _on_ast_literal_eval_failed_raw_string(
+        self,
+        value: str,
+        error: Exception,
+        *,
+        tool_name: Optional[str] = None,
+        arg_name: Optional[str] = None,
+        target_type: Any = None,
+    ) -> None:
+        pass
+
+    def _on_ifm_reasoning_prefix_stripped(self, prefix: str, content: str) -> None:
+        pass
+
     # IFM streaming (K2-V3 format) ------------------------------------
     #
     # vLLM's K2V3ToolParser does not stream the IFM dialects; the logic below is
@@ -889,8 +914,7 @@ class MultiFormatDetector(BaseFormatDetector):
             )
             yield name, args
 
-    @classmethod
-    def _ifm_prefix(cls, text: str, first_match_index: int) -> Optional[str]:
+    def _ifm_prefix(self, text: str, first_match_index: int) -> Optional[str]:
         """Leading content before the tool calls, with IFM reasoning stripped.
 
         vLLM cuts the prefix at the <ifm|tool_calls> wrapper when present,
@@ -898,11 +922,14 @@ class MultiFormatDetector(BaseFormatDetector):
         reasoning-effort block. Whitespace-only content before the tool call is
         preserved.
         """
-        group_index = text.find(cls._IFM_TOOL_CALLS_START_TOKEN)
+        group_index = text.find(self._IFM_TOOL_CALLS_START_TOKEN)
         cut = group_index if group_index != -1 else first_match_index
         if cut <= 0:
             return None
-        content = cls._strip_ifm_reasoning_prefix(text[:cut])
+        prefix = text[:cut]
+        content = self._strip_ifm_reasoning_prefix(prefix)
+        if content != prefix:
+            self._on_ifm_reasoning_prefix_stripped(prefix, content)
         return content if content != "" else None
 
     @classmethod
@@ -957,9 +984,8 @@ class MultiFormatDetector(BaseFormatDetector):
             return value
         return json.dumps(value, ensure_ascii=False)
 
-    @classmethod
     def _coerce_argument_value(
-        cls,
+        self,
         value: Any,
         tool_name: str,
         arg_name: str,
@@ -968,21 +994,27 @@ class MultiFormatDetector(BaseFormatDetector):
         arg_type: Optional[str] = None,
         from_text: bool = False,
     ) -> Any:
-        target_type = cls._schema_arg_type(tool_name, arg_name, tools) or arg_type
-        if cls._arg_type_preserves_text(target_type):
-            if cls._arg_type_is_any(target_type):
+        target_type = self._schema_arg_type(tool_name, arg_name, tools) or arg_type
+        if self._arg_type_preserves_text(target_type):
+            if self._arg_type_is_any(target_type):
                 return value
-            return cls._json_stringify(value)
+            return self._json_stringify(value)
         if isinstance(value, str) and (from_text or target_type is not None):
-            return cls._deserialize_glm_value(value)
+            return self._deserialize_glm_value(
+                value,
+                tool_name=tool_name,
+                arg_name=arg_name,
+                target_type=target_type,
+            )
         return value
 
-    @classmethod
     def _coerce_arguments(
-        cls, tool_name: str, arguments: dict[str, Any], tools: List[Tool]
+        self, tool_name: str, arguments: dict[str, Any], tools: List[Tool]
     ) -> dict[str, Any]:
         return {
-            arg_name: cls._coerce_argument_value(arg_value, tool_name, arg_name, tools)
+            arg_name: self._coerce_argument_value(
+                arg_value, tool_name, arg_name, tools
+            )
             for arg_name, arg_value in arguments.items()
         }
 
@@ -1038,17 +1070,35 @@ class MultiFormatDetector(BaseFormatDetector):
         r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
     )
 
-    @staticmethod
-    def _deserialize_glm_value(value: str) -> Any:
+    def _deserialize_glm_value(
+        self,
+        value: str,
+        *,
+        tool_name: Optional[str] = None,
+        arg_name: Optional[str] = None,
+        target_type: Any = None,
+    ) -> Any:
         value = value.strip()
         try:
             return json.loads(value)
-        except Exception:
-            pass
+        except Exception as json_error:
+            self._on_json_loads_failed_before_ast(
+                value,
+                json_error,
+                tool_name=tool_name,
+                arg_name=arg_name,
+                target_type=target_type,
+            )
         try:
             return ast.literal_eval(value)
-        except Exception:
-            pass
+        except Exception as ast_error:
+            self._on_ast_literal_eval_failed_raw_string(
+                value,
+                ast_error,
+                tool_name=tool_name,
+                arg_name=arg_name,
+                target_type=target_type,
+            )
         return value
 
     @staticmethod
@@ -1189,6 +1239,12 @@ class K2V3DetectorTracking(K2V3Detector):
             return preview[: limit - 3] + "..."
         return preview
 
+    def detect_and_parse(
+        self, text: str, tools: List[Tool]
+    ) -> StreamingParseResult:
+        self.clear_fallback_events()
+        return super().detect_and_parse(text, tools)
+
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
@@ -1199,81 +1255,48 @@ class K2V3DetectorTracking(K2V3Detector):
         finally:
             self._suppress_fallback_tracking = previous
 
-    def _ifm_prefix(self, text: str, first_match_index: int) -> str:
-        group_index = text.find(self._IFM_TOOL_CALLS_START_TOKEN)
-        cut = group_index if group_index != -1 else first_match_index
-        if cut <= 0:
-            return ""
-        prefix = text[:cut]
-        content = self._strip_ifm_reasoning_prefix(prefix)
-        if content != prefix:
-            self._record_fallback(
-                "ifm_reasoning_prefix_stripped",
-                "non_stream",
-                tool_format=self.tool_format,
-                prefix_preview=self._preview_value(prefix),
-            )
-        return content if content.strip() else ""
-
-    def _deserialize_glm_value_tracking(
+    def _on_json_loads_failed_before_ast(
         self,
         value: str,
-        tool_name: str,
-        arg_name: str,
-        target_type: Any,
-    ) -> Any:
-        value = value.strip()
-        try:
-            return json.loads(value)
-        except Exception as json_error:
-            self._record_fallback(
-                "json_loads_failed_ast_literal_eval",
-                "coercion",
-                tool_name=tool_name,
-                arg_name=arg_name,
-                target_type=target_type,
-                value_preview=self._preview_value(value),
-                error=json_error.__class__.__name__,
-            )
-        try:
-            return ast.literal_eval(value)
-        except Exception as ast_error:
-            self._record_fallback(
-                "ast_literal_eval_failed_raw_string",
-                "coercion",
-                tool_name=tool_name,
-                arg_name=arg_name,
-                target_type=target_type,
-                value_preview=self._preview_value(value),
-                error=ast_error.__class__.__name__,
-            )
-        return value
-
-    def _coerce_argument_value(
-        self,
-        value: Any,
-        tool_name: str,
-        arg_name: str,
-        tools: List[Tool],
+        error: Exception,
         *,
-        arg_type: Optional[str] = None,
-        from_text: bool = False,
-    ) -> Any:
-        target_type = self._schema_arg_type(tool_name, arg_name, tools) or arg_type
-        if self._arg_type_is_string(target_type):
-            return self._json_stringify(value)
-        if isinstance(value, str) and (from_text or target_type is not None):
-            return self._deserialize_glm_value_tracking(
-                value, tool_name, arg_name, target_type
-            )
-        return value
+        tool_name: Optional[str] = None,
+        arg_name: Optional[str] = None,
+        target_type: Any = None,
+    ) -> None:
+        self._record_fallback(
+            "json_loads_failed_ast_literal_eval",
+            "coercion",
+            tool_name=tool_name,
+            arg_name=arg_name,
+            target_type=target_type,
+            value_preview=self._preview_value(value),
+            error=error.__class__.__name__,
+        )
 
-    def _coerce_arguments(
-        self, tool_name: str, arguments: dict[str, Any], tools: List[Tool]
-    ) -> dict[str, Any]:
-        return {
-            arg_name: self._coerce_argument_value(
-                arg_value, tool_name, arg_name, tools
-            )
-            for arg_name, arg_value in arguments.items()
-        }
+    def _on_ast_literal_eval_failed_raw_string(
+        self,
+        value: str,
+        error: Exception,
+        *,
+        tool_name: Optional[str] = None,
+        arg_name: Optional[str] = None,
+        target_type: Any = None,
+    ) -> None:
+        self._record_fallback(
+            "ast_literal_eval_failed_raw_string",
+            "coercion",
+            tool_name=tool_name,
+            arg_name=arg_name,
+            target_type=target_type,
+            value_preview=self._preview_value(value),
+            error=error.__class__.__name__,
+        )
+
+    def _on_ifm_reasoning_prefix_stripped(self, prefix: str, content: str) -> None:
+        self._record_fallback(
+            "ifm_reasoning_prefix_stripped",
+            "non_stream",
+            tool_format=self.tool_format,
+            prefix_preview=self._preview_value(prefix),
+        )
