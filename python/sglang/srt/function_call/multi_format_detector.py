@@ -1046,7 +1046,10 @@ class MultiFormatDetector(BaseFormatDetector):
         except Exception:
             pass
         try:
-            return ast.literal_eval(value)
+            result = ast.literal_eval(value)
+            # Keep literal_eval results only when they remain JSON-serializable.
+            json.dumps(result)
+            return result
         except Exception:
             pass
         return value
