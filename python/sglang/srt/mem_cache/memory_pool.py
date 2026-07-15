@@ -1547,6 +1547,21 @@ class MLATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Relocate the compressed MLA latent for a set of slots. Used by
+        # --no-cache-thoughts to slide a finished request's answer KV into
+        # page-congruent slots before caching it. Native indexed copy over every
+        # layer buffer; the advanced-indexed RHS (kv_cache[src]) is materialized
+        # before the scatter write, so this is correct even when src and tgt
+        # overlap. Works for any store_dtype, including the NSA FP8 byte layout,
+        # since it copies whole slot rows verbatim.
+        if tgt_loc.numel() == 0:
+            return
+        tgt = tgt_loc.view(-1).long()
+        src = src_loc.view(-1).long()
+        for kv_cache in self.kv_buffer:
+            kv_cache[tgt] = kv_cache[src]
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,

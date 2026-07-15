@@ -127,6 +127,9 @@ class TreeNode:
         self.parent: TreeNode = None
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
+        # Per-token original RoPE positions, parallel to `value`. None when the node was
+        # inserted without positions (standard behavior).
+        self.positions: Optional[torch.Tensor] = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
@@ -432,15 +435,30 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return empty_match_result()
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        value, positions, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
+        # If any matched node carried original positions, concatenate and return them.
+        # Otherwise return None for backwards compatibility.
+        if positions and any(p is not None for p in positions):
+            # Replace any None entries (mixed-mode tree) with contiguous fallback positions.
+            # This should be rare; tree builders typically use positions consistently.
+            concat_positions = torch.cat(
+                [
+                    p if p is not None else torch.empty((0,), dtype=torch.int64, device=self.device)
+                    for p in positions
+                ]
+            )
+            original_positions = concat_positions
+        else:
+            original_positions = None
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
+            original_positions=original_positions,
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -451,22 +469,95 @@ class RadixCache(BasePrefixCache):
         value = params.value
         priority = params.priority
         chunked = params.chunked
+        positions = params.original_positions
 
         if value is None:
             value = torch.tensor(key.token_ids, dtype=torch.int64)
 
+        if positions is not None and len(positions) != len(key.token_ids):
+            raise ValueError(
+                f"original_positions length {len(positions)} does not match key "
+                f"token_ids length {len(key.token_ids)}"
+            )
+
         key, value = self.maybe_bigram_convert(key, value)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
+        prefix_len = self._insert_helper(
+            self.root_node, key, value, priority, chunked, positions
+        )
         return InsertResult(prefix_len=prefix_len)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
-        """Cache request when it finishes."""
+    def cache_finished_req(self, req: Req, is_insert: bool = True, split=None):
+        """Cache request when it finishes.
+
+        Args:
+            req: the finished request whose KV is being committed.
+            is_insert: when False, free the request's kv_indices without inserting them
+                into the radix tree (e.g. abort / retract paths).
+            split: when provided (a NoCacheThoughtsSplit from
+                ``sglang.srt.mem_cache.common.split_kv_for_no_cache_thoughts``), cache the
+                thought-stripped sequence: relocate the answer's KV into page-congruent
+                slots (``split.move_dst`` <- ``split.move_src``), insert the answer with
+                its original RoPE positions preserved, then free the page-aligned dead
+                tail (stale thoughts + unaligned answer remainder).
+        """
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
             is_insert = False
 
         kv_committed_len = req.pop_committed_kv_cache()
+
+        if split is not None:
+            # Skip the per-req KV-pool lookup; use the pre-computed plan.
+            # split.virtual_kv_indices is the request's FULL original slot span, so a
+            # single free here returns everything when we are not inserting.
+            if self.disable or not is_insert:
+                self.token_to_kv_pool_allocator.free(split.virtual_kv_indices)
+                self.dec_lock_ref(req.last_node)
+                return
+            # Relocate the answer's KV left into the slots the thoughts are vacating, so
+            # each cached answer token sits in a slot page-congruent to its NEW index in
+            # the thought-stripped sequence. Paged KV requires slot % page == index %
+            # page; without this the answer is unreachable for safe extension and trips
+            # the allocator's page-alignment assert. The move reads its source fully
+            # before writing (overlap-safe); the vacated thought slots are reclaimed below
+            # as part of the page-aligned dead tail.
+            if split.move_src.numel() > 0:
+                self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                    split.move_dst, split.move_src
+                )
+            keys = (
+                convert_to_bigram_key(split.virtual_token_ids)
+                if self.is_eagle
+                else split.virtual_token_ids
+            )
+            keys = page_align_keys(keys, self.page_size)
+            values = split.virtual_kv_indices[: len(keys)].to(
+                dtype=torch.int64, copy=True
+            )
+            positions = split.virtual_positions[: len(keys)].to(
+                dtype=torch.int64, copy=True
+            )
+            radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+            priority = getattr(req, "priority", 0) or 0
+            result = self.insert(
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    priority=priority,
+                    original_positions=positions,
+                )
+            )
+            new_prefix_len = result.prefix_len
+            self.token_to_kv_pool_allocator.free(
+                split.virtual_kv_indices[req.cache_protected_len : new_prefix_len]
+            )
+            # One page-aligned cut frees the dead tail: the stale thought slots plus the
+            # answer's page-unaligned remainder. Single free() -> no boundary double-free.
+            self.token_to_kv_pool_allocator.free(split.virtual_kv_indices[len(keys) :])
+            self.dec_lock_ref(req.last_node)
+            return
+
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
@@ -671,6 +762,7 @@ class RadixCache(BasePrefixCache):
         child_key = self.get_child_key_fn(key)
 
         value = []
+        positions = []  # Parallel list of per-node positions tensors (or Nones).
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
@@ -678,17 +770,19 @@ class RadixCache(BasePrefixCache):
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
+                positions.append(new_node.positions)
                 node = new_node
                 break
             else:
                 value.append(child.value)
+                positions.append(child.positions)
                 node = child
                 key = key[prefix_len:]
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
 
-        return value, node
+        return value, positions, node
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # new_node -> child
@@ -700,6 +794,10 @@ class RadixCache(BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        # Split positions in lockstep with value.
+        if child.positions is not None:
+            new_node.positions = child.positions[:split_len].clone()
+            child.positions = child.positions[split_len:].clone()
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
@@ -727,6 +825,7 @@ class RadixCache(BasePrefixCache):
         value,
         priority: int = 0,
         chunked: bool = False,
+        positions: Optional[torch.Tensor] = None,
     ):
         # Convert None priority to 0
         if priority is None:
@@ -748,6 +847,8 @@ class RadixCache(BasePrefixCache):
             total_prefix_length += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
+            if positions is not None:
+                positions = positions[prefix_len:]
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -765,6 +866,8 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            if positions is not None:
+                new_node.positions = positions.clone()
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)

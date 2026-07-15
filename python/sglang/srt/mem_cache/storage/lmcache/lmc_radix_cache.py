@@ -211,10 +211,21 @@ class LMCRadixCache(RadixCache):
 
         return base_res
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:  # type: ignore[override]
-        """On request completion, insert device KV into radix and store to LMCache."""
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, split=None
+    ) -> None:  # type: ignore[override]
+        """On request completion, insert device KV into radix and store to LMCache.
 
-        super().cache_finished_req(req, is_insert=is_insert)
+        When --no-cache-thoughts passes a split, the inner radix accepts it (and stores
+        only the answer slice). The LMCache offload that follows reads req.fill_ids
+        directly and may offload more tokens than the radix retained; treat this as a
+        soft-no-op for the offload portion until proper split-aware offload lands.
+        """
+        if split is not None:
+            from sglang.srt.mem_cache.common import warn_split_unsupported_once
+
+            warn_split_unsupported_once("LMCRadixCache")
+        super().cache_finished_req(req, is_insert=is_insert, split=split)
         if not is_insert:
             return
 

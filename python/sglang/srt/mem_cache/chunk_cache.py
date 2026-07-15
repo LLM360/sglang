@@ -65,7 +65,14 @@ class ChunkCache(BasePrefixCache):
         # ChunkCache does not support prefix caching, so insert is a no-op
         return InsertResult(prefix_len=0)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
+    def cache_finished_req(self, req: Req, is_insert: bool = True, split=None):
+        # ChunkCache does not implement prefix caching, so it cannot honor a
+        # split-insertion request from --no-cache-thoughts. Fall back to the
+        # default behavior; the caller's split is dropped.
+        if split is not None:
+            from sglang.srt.mem_cache.common import warn_split_unsupported_once
+
+            warn_split_unsupported_once("ChunkCache")
         kv_committed_len = req.pop_committed_kv_cache()
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         kv_indices = self.req_to_token_pool.req_to_token[
