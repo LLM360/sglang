@@ -1091,7 +1091,7 @@ class MultiFormatDetector(BaseFormatDetector):
             )
         try:
             result = ast.literal_eval(value)
-           # Try json serialization here in case that raises
+            # Keep literal_eval results only when they remain JSON-serializable.
             json.dumps(result)
             return result
         except Exception as ast_error:
