@@ -28,6 +28,7 @@ from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.multi_format_detector import (
     K2V3Detector,
+    K2V3DetectorTracking,
     MultiFormatDetector,
 )
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
@@ -58,6 +59,7 @@ class FunctionCallParser:
         "glm47": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
         "k2_v3": K2V3Detector,
+        "k2_v3_tracking": K2V3DetectorTracking,
         "kimi_k2": KimiK2Detector,
         "lfm2": Lfm2Detector,
         "llama3": Llama32Detector,
