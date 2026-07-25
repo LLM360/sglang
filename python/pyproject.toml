@@ -177,6 +177,7 @@ killall_sglang = "sglang.cli.killall:main"
 exclude = [
   "assets*",
   "benchmark*",
+  "build*",
   "docs*",
   "dist*",
   "playground*",
@@ -188,6 +189,7 @@ exclude = [
 exclude = [
   "assets*",
   "benchmark*",
+  "build*",
   "docs*",
   "dist*",
   "playground*",
