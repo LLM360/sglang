@@ -276,6 +276,18 @@ class TestGlmDialect(unittest.TestCase):
         # ast.literal handles tuple syntax; serialized as a JSON array.
         self.assertEqual(args["days"], [1, 2])
 
+    def test_python_set_literal_value_stays_string(self):
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>days</arg_key><arg_value>{1, 2}</arg_value>"
+            "</tool_call>"
+        )
+        result = self.det.detect_and_parse(text, self.tools)
+        args = json.loads(result.calls[0].parameters)
+        # ast.literal_eval yields a set, which JSON cannot represent; the raw
+        # string is kept so the arguments dict stays serializable.
+        self.assertEqual(args["days"], "{1, 2}")
+
 
 class TestGptOssDialect(unittest.TestCase):
     def setUp(self):

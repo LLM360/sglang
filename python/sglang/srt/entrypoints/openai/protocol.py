@@ -588,6 +588,10 @@ class ChatCompletionRequest(BaseModel):
     parallel_tool_calls: bool = True
     return_hidden_states: bool = False
     return_routed_experts: bool = False
+    # Skip this many leading token positions in the returned routed_experts
+    # tensor; multi-turn clients that already hold the prefix rows receive
+    # only the rows for newly processed tokens.
+    routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
     return_prompt_token_ids: bool = False
     return_completion_token_ids: bool = False
