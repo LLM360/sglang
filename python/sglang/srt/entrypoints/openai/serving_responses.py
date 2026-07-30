@@ -57,7 +57,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import ReasoningParser, StreamingParseResult
 from sglang.srt.utils import random_uuid
 
 if TYPE_CHECKING:
@@ -384,6 +384,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
+                reasoning_effort=(
+                    request.reasoning.effort if request.reasoning else None
+                ),
             )
 
             # Follow SGLang's _process_messages pattern
@@ -816,8 +819,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         request: ResponsesRequest,
         sampling_params: Any,
-        result_generator: AsyncIterator[StreamingHarmonyContext],
-        context: StreamingHarmonyContext,
+        result_generator: AsyncIterator[ConversationContext],
+        context: ConversationContext,
         model_name: str,
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
@@ -871,6 +874,26 @@ class OpenAIServingResponses(OpenAIServingChat):
                 response=initial_response,
             )
         )
+
+        if not self.use_harmony:
+            async for event in self._process_simple_streaming_events(
+                request=request,
+                result_generator=result_generator,
+            ):
+                yield _send_event(event)
+
+            yield _send_event(
+                await self._create_streaming_completed_event(
+                    request=request,
+                    sampling_params=sampling_params,
+                    context=context,
+                    model_name=model_name,
+                    tokenizer=tokenizer,
+                    request_metadata=request_metadata,
+                    created_time=created_time,
+                )
+            )
+            return
 
         async for ctx in result_generator:
 
@@ -1215,6 +1238,30 @@ class OpenAIServingResponses(OpenAIServingChat):
                         )
                     )
 
+        yield _send_event(
+            await self._create_streaming_completed_event(
+                request=request,
+                sampling_params=sampling_params,
+                context=context,
+                model_name=model_name,
+                tokenizer=tokenizer,
+                request_metadata=request_metadata,
+                created_time=created_time,
+            )
+        )
+
+    async def _create_streaming_completed_event(
+        self,
+        request: ResponsesRequest,
+        sampling_params: Any,
+        context: ConversationContext,
+        model_name: str,
+        tokenizer: Any,
+        request_metadata: RequestResponseMetadata,
+        created_time: int,
+    ) -> openai_responses_types.ResponseCompletedEvent:
+        """Build the terminal event after the streaming generator is consumed."""
+
         async def empty_async_generator():
             if False:
                 yield
@@ -1229,10 +1276,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             request_metadata,
             created_time=created_time,
         )
-        # Convert final_response to the format expected by ResponseCompletedEvent
         response_dict = final_response.model_dump()
-
-        # Convert UsageInfo to ResponseUsage format
         if response_dict.get("usage"):
             usage_info = response_dict["usage"]
             response_dict["usage"] = {
@@ -1247,13 +1291,211 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
 
-        yield _send_event(
-            openai_responses_types.ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=response_dict,
-            )
+        return openai_responses_types.ResponseCompletedEvent(
+            type="response.completed",
+            sequence_number=-1,
+            response=response_dict,
         )
+
+    async def _process_simple_streaming_events(
+        self,
+        request: ResponsesRequest,
+        result_generator: AsyncIterator[ConversationContext],
+    ):
+        """Stream non-Harmony reasoning/content with terminal parser finalization."""
+        reasoning_parser = (
+            ReasoningParser(
+                model_type=self.reasoning_parser,
+                stream_reasoning=True,
+                request=request,
+            )
+            if self.reasoning_parser
+            else None
+        )
+        previous_text = ""
+        current_output_index = 0
+        current_content_index = 0
+        current_item_id = ""
+        current_kind: Optional[str] = None
+        current_text_parts: list[str] = []
+
+        def start_item(kind: str):
+            nonlocal current_item_id, current_kind, current_content_index
+            current_item_id = f"item_{random_uuid()}"
+            current_kind = kind
+            current_content_index = 0
+            current_text_parts.clear()
+            if kind == "reasoning":
+                item = ResponseReasoningItem(
+                    type="reasoning",
+                    id=current_item_id,
+                    summary=[],
+                    status="in_progress",
+                )
+            else:
+                item = openai_responses_types.ResponseOutputMessage(
+                    id=current_item_id,
+                    type="message",
+                    role="assistant",
+                    content=[],
+                    status="in_progress",
+                )
+            return [
+                openai_responses_types.ResponseOutputItemAddedEvent(
+                    type="response.output_item.added",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    item=item,
+                ),
+                openai_responses_types.ResponseContentPartAddedEvent(
+                    type="response.content_part.added",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    item_id=current_item_id,
+                    content_index=current_content_index,
+                    part=openai_responses_types.ResponseOutputText(
+                        type="output_text",
+                        text="",
+                        annotations=[],
+                        logprobs=None,
+                    ),
+                ),
+            ]
+
+        def finish_item():
+            if current_kind is None:
+                return []
+            text = "".join(current_text_parts)
+            if current_kind == "reasoning":
+                item = ResponseReasoningItem(
+                    type="reasoning",
+                    content=[
+                        ResponseReasoningTextContent(
+                            text=text,
+                            type="reasoning_text",
+                        )
+                    ],
+                    status="completed",
+                    id=current_item_id,
+                    summary=[],
+                )
+                return [
+                    openai_responses_types.ResponseReasoningTextDoneEvent(
+                        type="response.reasoning_text.done",
+                        item_id=current_item_id,
+                        sequence_number=-1,
+                        output_index=current_output_index,
+                        content_index=current_content_index,
+                        text=text,
+                    ),
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=current_output_index,
+                        item=item,
+                    ),
+                ]
+
+            part = openai_responses_types.ResponseOutputText(
+                text=text,
+                type="output_text",
+                annotations=[],
+                logprobs=None,
+            )
+            item = openai_responses_types.ResponseOutputMessage(
+                type="message",
+                role="assistant",
+                content=[part],
+                status="completed",
+                id=current_item_id,
+            )
+            return [
+                openai_responses_types.ResponseTextDoneEvent(
+                    type="response.output_text.done",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    content_index=current_content_index,
+                    text=text,
+                    logprobs=[],
+                    item_id=current_item_id,
+                ),
+                openai_responses_types.ResponseContentPartDoneEvent(
+                    type="response.content_part.done",
+                    sequence_number=-1,
+                    item_id=current_item_id,
+                    output_index=current_output_index,
+                    content_index=current_content_index,
+                    part=part,
+                ),
+                openai_responses_types.ResponseOutputItemDoneEvent(
+                    type="response.output_item.done",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    item=item,
+                ),
+            ]
+
+        async for ctx in result_generator:
+            assert isinstance(ctx, SimpleContext)
+            output = ctx.last_output
+            if output is None:
+                continue
+            current_text = output["text"]
+            delta_text = current_text[len(previous_text) :]
+            previous_text = current_text
+            finish_reason = output.get("meta_info", {}).get("finish_reason")
+            finish_reason_type = finish_reason.get("type") if finish_reason else None
+
+            results = []
+            if reasoning_parser is not None:
+                results.append(reasoning_parser.parse_stream_chunk_result(delta_text))
+                if finish_reason_type in {"stop", "length"}:
+                    finalization = reasoning_parser.finalize_reasoning_streaming()
+                    if finalization is not None and finalization.result is not None:
+                        results.append(finalization.result)
+            else:
+                results.append(StreamingParseResult(normal_text=delta_text))
+
+            for result in results:
+                visible_deltas = []
+                if result.has_reasoning_text and result.reasoning_text:
+                    visible_deltas.append(("reasoning", result.reasoning_text))
+                if result.has_normal_text:
+                    visible_deltas.append(("content", result.normal_text))
+
+                for kind, text_delta in visible_deltas:
+                    if current_kind != kind:
+                        if current_kind is not None:
+                            for event in finish_item():
+                                yield event
+                            current_output_index += 1
+                        for event in start_item(kind):
+                            yield event
+
+                    current_text_parts.append(text_delta)
+                    if kind == "reasoning":
+                        event = openai_responses_types.ResponseReasoningTextDeltaEvent(
+                            type="response.reasoning_text.delta",
+                            item_id=current_item_id,
+                            output_index=current_output_index,
+                            content_index=current_content_index,
+                            delta=text_delta,
+                            sequence_number=-1,
+                        )
+                    else:
+                        event = openai_responses_types.ResponseTextDeltaEvent(
+                            type="response.output_text.delta",
+                            sequence_number=-1,
+                            content_index=current_content_index,
+                            output_index=current_output_index,
+                            item_id=current_item_id,
+                            delta=text_delta,
+                            logprobs=[],
+                        )
+                    yield event
+
+        for event in finish_item():
+            yield event
 
     async def _generate_with_builtin_tools(
         self,

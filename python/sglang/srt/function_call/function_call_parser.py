@@ -165,6 +165,17 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
+    def finalize_streaming(self) -> Tuple[str, list[ToolCallItem]]:
+        """Release detector-held text after normal model completion."""
+        if not self.tools:
+            return "", []
+        result = self.detector.finalize_streaming(self.tools)
+        return result.normal_text or "", result.calls
+
+    def has_pending_streaming_output(self) -> bool:
+        """Return whether the detector is holding unresolved source text."""
+        return self.detector.has_pending_streaming_output()
+
     def get_structure_tag(self) -> LegacyStructuralTagResponseFormat:
         """
         Generate a structural tag response format for all available tools.
