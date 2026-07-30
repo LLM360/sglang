@@ -1,7 +1,6 @@
-"""Unit tests for K2V3Detector (BBQ 0518 IFM tool-call format).
+"""K2-V3 and multi-format tool parser regression tests.
 
-Ported from vLLM's K2V3ToolParser tests
-(tests/entrypoints/openai/tool_parsers/test_multi_format_tool_parser.py).
+Ported from LLM360/vllm PR #12.
 """
 
 import json
@@ -13,11 +12,12 @@ from sglang.srt.function_call.multi_format_detector import (
     MultiFormatDetector,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(5, "stage-a-test-cpu")
 
 
-def _make_tool(name, parameters=None):
+def _make_tool(name: str, parameters: dict | None = None) -> Tool:
     return Tool(
         type="function",
         function=Function(
@@ -32,45 +32,209 @@ def _make_tool(name, parameters=None):
     )
 
 
-class TestK2V3DetectorConstruction(unittest.TestCase):
-    """K2V3Detector defaults to the IFM 'xml' dialect with no delegate."""
+TOOLS = [_make_tool("get_weather"), _make_tool("get_time")]
+CALL_1 = (
+    "<ifm|tool_call>get_weather"
+    "<ifm|arg_key>city</ifm|arg_key>"
+    "<ifm|arg_value>Tokyo</ifm|arg_value>"
+    "</ifm|tool_call>"
+)
+CALL_2 = (
+    "<ifm|tool_call>get_time"
+    "<ifm|arg_key>city</ifm|arg_key>"
+    "<ifm|arg_value>Seoul</ifm|arg_value>"
+    "</ifm|tool_call>"
+)
+GROUPED_CALL_1 = f"<ifm|tool_calls>{CALL_1}</ifm|tool_calls>"
+GROUPED_CALLS = f"<ifm|tool_calls>{CALL_1}{CALL_2}</ifm|tool_calls>"
 
-    def test_default_dialect_is_xml(self):
-        det = K2V3Detector()
-        self.assertEqual(det.tool_format, "xml")
-        self.assertIsNone(det._delegate)
 
-    def test_subclass_of_multi_format(self):
+def _collect_stream(detector, chunks, *, finalize=False):
+    normal_text = ""
+    calls = []
+    for chunk in chunks:
+        result = detector.parse_streaming_increment(chunk, TOOLS)
+        normal_text += result.normal_text or ""
+        calls.extend(result.calls)
+    if finalize:
+        result = detector.finalize_streaming(TOOLS)
+        normal_text += result.normal_text or ""
+        calls.extend(result.calls)
+    return normal_text, calls
+
+
+class TestConstruction(CustomTestCase):
+    def test_k2_defaults_to_xml(self):
+        detector = K2V3Detector()
+        self.assertEqual(detector.tool_format, "xml")
+        self.assertIsNone(detector._delegate)
+
+    def test_tool_call_format_selects_dialect(self):
+        detector = K2V3Detector(chat_template_kwargs={"tool_call_format": "xml_typed"})
+        self.assertEqual(detector.tool_format, "xml_typed")
+
+    def test_legacy_format_kwargs_are_rejected(self):
+        for name in ("tool_format", "tool_calling_format"):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValueError, f"Unsupported argument: {name}"
+            ):
+                K2V3Detector(chat_template_kwargs={name: "xml"})
+
+
+class TestMultiFormatStreaming(CustomTestCase):
+    def test_streaming_emits_leading_content_and_complete_ifm_call_together(self):
+        detector = MultiFormatDetector(tool_format="xml")
+
+        result = detector.parse_streaming_increment("\n" + CALL_1, TOOLS)
+
+        self.assertEqual(result.normal_text, "\n")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
+
+    def test_streaming_emits_each_complete_ifm_call_once(self):
+        detector = MultiFormatDetector(tool_format="xml")
+
+        _, calls = _collect_stream(
+            detector,
+            ["<ifm|tool_calls>" + CALL_1, CALL_2 + "</ifm|tool_calls>"],
+        )
+
+        self.assertEqual([call.name for call in calls], ["get_weather", "get_time"])
+        self.assertEqual(
+            [json.loads(call.parameters) for call in calls],
+            [{"city": "Tokyo"}, {"city": "Seoul"}],
+        )
+        self.assertEqual([call.tool_index for call in calls], [0, 1])
+
+    def test_streaming_records_structured_arguments_for_finish_processing(self):
+        detector = MultiFormatDetector(tool_format="xml")
+
+        detector.parse_streaming_increment(CALL_1, TOOLS)
+
+        self.assertEqual(
+            detector.prev_tool_call_arr,
+            [{"name": "get_weather", "arguments": {"city": "Tokyo"}}],
+        )
+        self.assertEqual(detector.streamed_args_for_tool, ['{"city": "Tokyo"}'])
+
+    def test_ifm_streaming_does_not_treat_generic_tool_call_as_marker(self):
+        detector = MultiFormatDetector(tool_format="xml")
+        content = "Use <tool_call> literally in the documentation."
+
+        normal_text, calls = _collect_stream(detector, [content], finalize=True)
+
+        self.assertEqual(normal_text, content)
+        self.assertEqual(calls, [])
+
+
+class TestK2GroupedToolCalls(CustomTestCase):
+    def test_k2_v3_streaming_requires_grouped_ifm_tool_calls(self):
+        detector = K2V3Detector()
+
+        normal_text, calls = _collect_stream(detector, [CALL_1], finalize=True)
+
+        self.assertEqual(normal_text, CALL_1)
+        self.assertEqual(calls, [])
+
+    def test_k2_v3_nonstreaming_requires_grouped_ifm_tool_calls(self):
+        result = K2V3Detector().detect_and_parse(CALL_1, TOOLS)
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, CALL_1)
+
+    def test_k2_v3_nonstreaming_requires_closed_grouped_ifm_tool_calls(self):
+        incomplete_group = "<ifm|tool_calls>" + CALL_1
+
+        result = K2V3Detector().detect_and_parse(incomplete_group, TOOLS)
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, incomplete_group)
+
+    def test_k2_v3_nonstreaming_invalid_closed_group_preserves_full_content(self):
+        wrapped_contents = ("", "<ifm|tool_call>get_weather")
+        for wrapped_content in wrapped_contents:
+            with self.subTest(wrapped_content=wrapped_content):
+                model_output = (
+                    "Content prefix. "
+                    f"<ifm|tool_calls>{wrapped_content}</ifm|tool_calls>"
+                    " Content suffix."
+                )
+
+                result = K2V3Detector().detect_and_parse(model_output, TOOLS)
+
+                self.assertEqual(result.calls, [])
+                self.assertEqual(result.normal_text, model_output)
+
+    def test_k2_v3_nonstreaming_parses_only_closed_grouped_ifm_tool_calls(self):
+        cases = (
+            (GROUPED_CALL_1, ["get_weather"]),
+            (GROUPED_CALLS, ["get_weather", "get_time"]),
+        )
+        for grouped_calls, expected_names in cases:
+            with self.subTest(expected_names=expected_names):
+                result = K2V3Detector().detect_and_parse(grouped_calls, TOOLS)
+
+                self.assertEqual(result.normal_text, "")
+                self.assertEqual([call.name for call in result.calls], expected_names)
+
+    def test_multi_format_nonstreaming_keeps_singular_ifm_compatibility(self):
+        result = MultiFormatDetector(tool_format="xml").detect_and_parse(CALL_1, TOOLS)
+
+        self.assertEqual([call.name for call in result.calls], ["get_weather"])
+
+    def test_k2_v3_streaming_parses_grouped_ifm_tool_calls(self):
+        normal_text, calls = _collect_stream(K2V3Detector(), [GROUPED_CALL_1])
+
+        self.assertEqual(normal_text, "")
+        self.assertEqual([call.name for call in calls], ["get_weather"])
+
+    def test_k2_v3_streaming_waits_for_complete_group_before_emitting_calls(self):
+        detector = K2V3Detector()
+        incomplete_group = "<ifm|tool_calls>" + CALL_1
+
+        result = detector.parse_streaming_increment(incomplete_group, TOOLS)
+
+        self.assertEqual(result.calls, [])
+        self.assertTrue(detector.has_pending_streaming_output())
+        final_result = detector.finalize_streaming(TOOLS)
+        self.assertEqual(final_result.normal_text, incomplete_group)
+        self.assertEqual(final_result.calls, [])
+        self.assertFalse(detector.has_pending_streaming_output())
+
+    def test_k2_v3_streaming_preserves_multiple_complete_calls(self):
+        _, calls = _collect_stream(K2V3Detector(), [GROUPED_CALLS])
+
+        self.assertEqual([call.name for call in calls], ["get_weather", "get_time"])
+        self.assertEqual([call.tool_index for call in calls], [0, 1])
+
+    def test_grouped_json_dialect_uses_schema_coercion(self):
+        output = (
+            "<ifm|tool_calls><ifm|tool_call>"
+            '{"name":"get_weather","arguments":{"city":12345}}'
+            "</ifm|tool_call></ifm|tool_calls>"
+        )
+
+        result = K2V3Detector(tool_format="json").detect_and_parse(output, TOOLS)
+
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "12345"})
+
+
+class TestK2RegressionCoverage(CustomTestCase):
+    """Retain parser coverage that predates the grouped-call regressions."""
+
+    @staticmethod
+    def _group(*calls: str) -> str:
+        return f"<ifm|tool_calls>{''.join(calls)}</ifm|tool_calls>"
+
+    def test_construction_and_unknown_dialect(self):
         self.assertIsInstance(K2V3Detector(), MultiFormatDetector)
-
-    def test_tool_call_format_kwarg_selects_dialect(self):
-        det = K2V3Detector(chat_template_kwargs={"tool_call_format": "xml_typed"})
-        self.assertEqual(det.tool_format, "xml_typed")
-
-    def test_tool_format_kwarg_is_rejected(self):
-        with self.assertRaisesRegex(
-            ValueError, "Unsupported argument: tool_format"
-        ):
-            K2V3Detector(chat_template_kwargs={"tool_format": "json"})
-
-    def test_tool_calling_format_kwarg_is_rejected(self):
-        with self.assertRaisesRegex(
-            ValueError, "Unsupported argument: tool_calling_format"
-        ):
-            K2V3Detector(chat_template_kwargs={"tool_calling_format": "xml_typed"})
-
-    def test_json_dialect_via_positional(self):
-        det = K2V3Detector(tool_format="json")
-        self.assertEqual(det.tool_format, "json")
-
-    def test_unknown_dialect_errors(self):
+        self.assertEqual(K2V3Detector(tool_format="json").tool_format, "json")
         with self.assertRaisesRegex(ValueError, "Unsupported tool_format"):
             K2V3Detector(tool_format="not-a-dialect")
 
-
-class TestK2V3XmlExtraction(unittest.TestCase):
-    def setUp(self):
-        self.tools = [
+    def test_xml_schema_coercion_no_args_and_unknown_tools(self):
+        tools = [
             _make_tool(
                 "get_weather",
                 {
@@ -82,680 +246,257 @@ class TestK2V3XmlExtraction(unittest.TestCase):
                 },
             )
         ]
-        self.det = K2V3Detector()
-
-    def test_has_tool_call(self):
-        text = (
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        self.assertTrue(self.det.has_tool_call(text))
-        self.assertFalse(self.det.has_tool_call("no markers here"))
-
-    def test_single_call(self):
-        text = (
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(result.calls[0].tool_index, 0)
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
-        self.assertIsNone(result.normal_text)
-
-    def test_schema_typed_value_coercion(self):
-        # 'days' is declared integer in the schema -> deserialized to int 3.
-        text = (
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>days</ifm|arg_key><ifm|arg_value>3</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(json.loads(result.calls[0].parameters), {"days": 3})
-
-    def test_schema_string_preserves_argument_whitespace(self):
-        text = (
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key>"
-            "<ifm|arg_value>\nTokyo\n</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "\nTokyo\n"})
-
-    def test_schema_integer_strips_outer_whitespace_before_coercion(self):
-        text = (
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>days</ifm|arg_key><ifm|arg_value>\n3\n</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(json.loads(result.calls[0].parameters), {"days": 3})
-
-    def test_no_args(self):
-        text = "<ifm|tool_call>get_weather</ifm|tool_call>"
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(json.loads(result.calls[0].parameters), {})
-
-    def test_no_markers_returns_full_text(self):
-        result = self.det.detect_and_parse("plain text", self.tools)
-        self.assertEqual(result.calls, [])
-        self.assertEqual(result.normal_text, "plain text")
-
-    def test_unknown_tool_is_forwarded(self):
-        text = (
-            "<ifm|tool_call>not_registered"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].tool_index, -1)
-        self.assertEqual(result.calls[0].name, "not_registered")
-
-
-class TestK2V3XmlTyped(unittest.TestCase):
-    """The <ifm|arg_type> hint forces a value to stay a string."""
-
-    def test_arg_type_string_keeps_numeric_as_string(self):
-        det = K2V3Detector(tool_format="xml_typed")
-        # No schema type for user_id; the inline <ifm|arg_type>string</...> wins.
-        text = (
-            "<ifm|tool_call>study_args"
-            "<ifm|arg_key>user_id</ifm|arg_key>"
-            "<ifm|arg_type>string</ifm|arg_type>"
-            "<ifm|arg_value>12345</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        result = det.detect_and_parse(text, [_make_tool("study_args")])
-        self.assertEqual(json.loads(result.calls[0].parameters), {"user_id": "12345"})
-
-    def test_arg_type_any_preserves_argument_whitespace(self):
-        det = K2V3Detector(tool_format="xml_typed")
-        text = (
-            "<ifm|tool_call>study_args"
-            "<ifm|arg_key>notes</ifm|arg_key>"
-            "<ifm|arg_type>any</ifm|arg_type>"
-            "<ifm|arg_value>\nkeep me\n</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        result = det.detect_and_parse(text, [_make_tool("study_args")])
-        self.assertEqual(
-            json.loads(result.calls[0].parameters), {"notes": "\nkeep me\n"}
+        cases = (
+            (
+                "<ifm|tool_call>get_weather"
+                "<ifm|arg_key>city</ifm|arg_key>"
+                "<ifm|arg_value>\nTokyo\n</ifm|arg_value>"
+                "</ifm|tool_call>",
+                {"city": "\nTokyo\n"},
+                0,
+            ),
+            (
+                "<ifm|tool_call>get_weather"
+                "<ifm|arg_key>days</ifm|arg_key>"
+                "<ifm|arg_value>\n3\n</ifm|arg_value>"
+                "</ifm|tool_call>",
+                {"days": 3},
+                0,
+            ),
+            ("<ifm|tool_call>get_weather</ifm|tool_call>", {}, 0),
+            (
+                "<ifm|tool_call>not_registered"
+                "<ifm|arg_key>city</ifm|arg_key>"
+                "<ifm|arg_value>Tokyo</ifm|arg_value>"
+                "</ifm|tool_call>",
+                {"city": "Tokyo"},
+                -1,
+            ),
         )
 
-    def test_boolean_arg_type_strips_outer_whitespace_before_coercion(self):
-        det = K2V3Detector(tool_format="xml_typed")
-        text = (
-            "<ifm|tool_call>study_args"
-            "<ifm|arg_key>enabled</ifm|arg_key>"
-            "<ifm|arg_type>boolean</ifm|arg_type>"
-            "<ifm|arg_value>\ntrue\n</ifm|arg_value>"
-            "</ifm|tool_call>"
+        for call, expected_arguments, expected_index in cases:
+            with self.subTest(expected_arguments=expected_arguments):
+                result = K2V3Detector().detect_and_parse(self._group(call), tools)
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(
+                    json.loads(result.calls[0].parameters), expected_arguments
+                )
+                self.assertEqual(result.calls[0].tool_index, expected_index)
+
+    def test_xml_typed_inline_coercion(self):
+        tools = [_make_tool("study_args")]
+        cases = (
+            (
+                "user_id",
+                "string",
+                "12345",
+                {"user_id": "12345"},
+            ),
+            (
+                "notes",
+                "any",
+                "\nkeep me\n",
+                {"notes": "\nkeep me\n"},
+            ),
+            (
+                "enabled",
+                "boolean",
+                "\ntrue\n",
+                {"enabled": True},
+            ),
         )
-        result = det.detect_and_parse(text, [_make_tool("study_args")])
-        self.assertEqual(json.loads(result.calls[0].parameters), {"enabled": True})
 
-
-class TestK2V3ReasoningPrefix(unittest.TestCase):
-    def setUp(self):
-        self.tools = [_make_tool("get_weather")]
-        self.det = K2V3Detector()
-
-    def test_ifm_reasoning_prefix_is_stripped(self):
-        text = (
-            "<ifm|think>need lookup</ifm|think>\n"
-            "<ifm|tool_calls>\n"
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>\n"
-            "</ifm|tool_calls>"
-        )
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(result.normal_text, "\n")
-        self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
-
-    def test_tool_only_preserves_newline_after_reasoning_prefix(self):
-        text = (
-            "<ifm|think>\n</ifm|think>\n"
-            "<ifm|tool_calls>\n"
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>\n"
-            "</ifm|tool_calls>"
-        )
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(result.normal_text, "\n")
-        self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
-
-    def test_tool_only_preserves_whitespace_prefix_before_tool_calls(self):
-        text = (
-            "\n"
-            "<ifm|tool_calls>\n"
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>\n"
-            "</ifm|tool_calls>"
-        )
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(result.normal_text, "\n")
-        self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
-
-    def test_all_three_effort_blocks_are_stripped(self):
-        for think in ("think", "think_fast", "think_faster"):
-            with self.subTest(think=think):
-                text = (
-                    f"<ifm|{think}>reasoning</ifm|{think}>"
-                    "<ifm|tool_call>get_weather"
-                    "<ifm|arg_key>city</ifm|arg_key>"
-                    "<ifm|arg_value>Tokyo</ifm|arg_value>"
+        for key, arg_type, value, expected_arguments in cases:
+            with self.subTest(arg_type=arg_type):
+                call = (
+                    "<ifm|tool_call>study_args"
+                    f"<ifm|arg_key>{key}</ifm|arg_key>"
+                    f"<ifm|arg_type>{arg_type}</ifm|arg_type>"
+                    f"<ifm|arg_value>{value}</ifm|arg_value>"
                     "</ifm|tool_call>"
                 )
-                result = self.det.detect_and_parse(text, self.tools)
-                self.assertIsNone(result.normal_text)
-                self.assertEqual(result.calls[0].name, "get_weather")
+                result = K2V3Detector(tool_format="xml_typed").detect_and_parse(
+                    self._group(call), tools
+                )
+                self.assertEqual(
+                    json.loads(result.calls[0].parameters), expected_arguments
+                )
 
-    def test_stripped_ifm_reasoning_prefix_empty_content_returns_none(self):
-        text = (
-            "<ifm|think>need lookup</ifm|think>"
-            "<ifm|tool_calls>"
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>"
-            "</ifm|tool_calls>"
+    def test_json_argument_shapes(self):
+        detector = K2V3Detector(tool_format="json")
+        cases = (
+            (
+                '{"name":"get_weather","arguments":{"city":"Tokyo"}}',
+                [{"city": "Tokyo"}],
+            ),
+            (
+                '{"name":"get_weather","arguments":"{\\"city\\":\\"Tokyo\\"}"}',
+                [{"city": "Tokyo"}],
+            ),
+            (
+                '[{"name":"get_weather","arguments":{"city":"Tokyo"}},'
+                '{"name":"get_weather","arguments":{"city":"Osaka"}}]',
+                [{"city": "Tokyo"}, {"city": "Osaka"}],
+            ),
         )
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertIsNone(result.normal_text)
-        self.assertEqual(result.calls[0].name, "get_weather")
 
-    def test_legacy_think_prefix_is_not_stripped(self):
-        text = (
-            "<think>legacy reasoning</think>\n"
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
+        for payload, expected_arguments in cases:
+            with self.subTest(expected_arguments=expected_arguments):
+                call = f"<ifm|tool_call>{payload}</ifm|tool_call>"
+                result = detector.detect_and_parse(self._group(call), TOOLS)
+                self.assertEqual(
+                    [json.loads(item.parameters) for item in result.calls],
+                    expected_arguments,
+                )
+
+    def test_reasoning_prefix_and_whitespace_handling(self):
+        for effort in ("think", "think_fast", "think_faster"):
+            with self.subTest(effort=effort):
+                output = f"<ifm|{effort}>need lookup</ifm|{effort}>" + GROUPED_CALL_1
+                result = K2V3Detector().detect_and_parse(output, TOOLS)
+                self.assertEqual(result.normal_text, "")
+
+        output = "<ifm|think>need lookup</ifm|think>\n" + GROUPED_CALL_1
+        result = K2V3Detector().detect_and_parse(output, TOOLS)
+        self.assertEqual(result.normal_text, "")
+
+        legacy_prefix = "<think>legacy reasoning</think>\n"
+        result = K2V3Detector().detect_and_parse(legacy_prefix + GROUPED_CALL_1, TOOLS)
+        self.assertEqual(result.normal_text, legacy_prefix)
+
+    def test_grouped_streaming_handles_character_and_awkward_splits(self):
+        split_points = (
+            list(GROUPED_CALL_1),
+            [
+                "<ifm|tool_cal",
+                "ls><ifm|tool_call>get_wea",
+                "ther<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>To",
+                "kyo</ifm|arg_value></ifm|tool_call></ifm|tool_calls>",
+            ],
+        )
+
+        for chunks in split_points:
+            with self.subTest(chunk_count=len(chunks)):
+                normal_text, calls = _collect_stream(K2V3Detector(), chunks)
+                self.assertEqual(normal_text, "")
+                self.assertEqual([call.name for call in calls], ["get_weather"])
+                self.assertEqual(json.loads(calls[0].parameters), {"city": "Tokyo"})
+
+    def test_grouped_streaming_no_args_duplicate_calls_and_malformed_value(self):
+        no_args = "<ifm|tool_call>get_weather</ifm|tool_call>"
+        duplicate = CALL_1 + CALL_1.replace("Tokyo", "Osaka")
+        array_tools = [
+            _make_tool(
+                "todo",
+                {
+                    "type": "object",
+                    "properties": {"items": {"type": "array"}},
+                },
+            )
+        ]
+        empty_array = (
+            "<ifm|tool_call>todo"
+            "<ifm|arg_key>items</ifm|arg_key>"
+            "<ifm|arg_value></ifm|arg_value>"
             "</ifm|tool_call>"
         )
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(result.normal_text, "<think>legacy reasoning</think>\n")
-        self.assertEqual(result.calls[0].name, "get_weather")
 
+        _, calls = _collect_stream(K2V3Detector(), [self._group(no_args)])
+        self.assertEqual(json.loads(calls[0].parameters), {})
 
-class TestK2V3JsonDialect(unittest.TestCase):
-    def setUp(self):
-        self.tools = [_make_tool("get_weather")]
-        self.det = K2V3Detector(tool_format="json")
-
-    def test_json_object_tool_call(self):
-        text = (
-            "<ifm|tool_call>"
-            '{"name": "get_weather", "arguments": {"city": "Tokyo"}}'
-            "</ifm|tool_call>"
+        _, calls = _collect_stream(K2V3Detector(), [self._group(duplicate)])
+        self.assertEqual([call.tool_index for call in calls], [0, 1])
+        self.assertEqual(
+            [json.loads(call.parameters) for call in calls],
+            [{"city": "Tokyo"}, {"city": "Osaka"}],
         )
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertIsNone(result.normal_text)
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
 
-    def test_json_arguments_as_string(self):
-        text = (
-            "<ifm|tool_call>"
-            '{"name": "get_weather", "arguments": "{\\"city\\": \\"Tokyo\\"}"}'
-            "</ifm|tool_call>"
-        )
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
+        result = K2V3Detector().detect_and_parse(self._group(empty_array), array_tools)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"items": ""})
 
-    def test_json_list_of_tool_calls(self):
-        text = (
-            "<ifm|tool_call>"
-            '[{"name": "get_weather", "arguments": {"city": "Tokyo"}},'
-            ' {"name": "get_weather", "arguments": {"city": "Osaka"}}]'
-            "</ifm|tool_call>"
-        )
-        result = self.det.detect_and_parse(text, self.tools)
-        self.assertEqual([c.name for c in result.calls], ["get_weather", "get_weather"])
-        self.assertEqual(json.loads(result.calls[1].parameters), {"city": "Osaka"})
-
-
-def _collect_stream(detector, tools, chunks):
-    """Feed ``chunks`` to a detector's streaming parser and reassemble the
-    per-tool name + parameters, plus the concatenated normal text. Mirrors the
-    GLM detector streaming tests' collection helper."""
-    by_index = {}
-    order = []
-    normal_text = ""
-    for chunk in chunks:
-        result = detector.parse_streaming_increment(chunk, tools)
-        normal_text += result.normal_text or ""
-        for item in result.calls:
-            idx = item.tool_index
-            if idx not in by_index:
-                by_index[idx] = {"name": None, "parameters": ""}
-                order.append(idx)
-            if item.name:
-                by_index[idx]["name"] = item.name
-            if item.parameters:
-                by_index[idx]["parameters"] += item.parameters
-    return normal_text, [by_index[i] for i in order]
-
-
-class TestK2V3XmlStreaming(unittest.TestCase):
-    """The IFM xml/xml_typed dialects stream incrementally (name then args)."""
-
-    def setUp(self):
-        self.tools = [
+    def test_grouped_streaming_preserves_prefix_and_schema_coercion(self):
+        tools = [
             _make_tool(
                 "get_weather",
                 {
                     "type": "object",
-                    "properties": {
-                        "city": {"type": "string"},
-                        "days": {"type": "integer"},
-                    },
+                    "properties": {"days": {"type": "integer"}},
                 },
             )
         ]
-        self.block = (
+        call = (
             "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
+            "<ifm|arg_key>days</ifm|arg_key>"
+            "<ifm|arg_value>3</ifm|arg_value>"
             "</ifm|tool_call>"
         )
 
-    def _assert_single_weather(self, normal_text, calls, expected_args):
-        self.assertEqual(normal_text, "")
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["name"], "get_weather")
-        self.assertEqual(json.loads(calls[0]["parameters"]), expected_args)
-        # Streaming must reassemble to the same arguments the non-stream parser
-        # produces.
-        nonstream = K2V3Detector().detect_and_parse(self.block, self.tools)
-        self.assertEqual(
-            json.loads(calls[0]["parameters"]),
-            json.loads(nonstream.calls[0].parameters),
+        normal_text = ""
+        calls = []
+        detector = K2V3Detector()
+        for chunk in "I will check. " + self._group(call):
+            result = detector.parse_streaming_increment(chunk, tools)
+            normal_text += result.normal_text or ""
+            calls.extend(result.calls)
+
+        self.assertEqual(normal_text, "I will check. ")
+        self.assertEqual(json.loads(calls[0].parameters), {"days": 3})
+
+    def test_grouped_json_streaming_waits_for_complete_wrapper(self):
+        payload = (
+            '<ifm|tool_call>{"name":"get_weather",'
+            '"arguments":{"city":"Tokyo"}}</ifm|tool_call>'
         )
+        grouped = self._group(payload)
+        detector = K2V3Detector(tool_format="json")
 
-    def test_whole_block_one_chunk(self):
-        normal, calls = _collect_stream(K2V3Detector(), self.tools, [self.block])
-        self._assert_single_weather(normal, calls, {"city": "Tokyo"})
-
-    def test_char_by_char(self):
-        chunks = list(self.block)  # one character per chunk
-        normal, calls = _collect_stream(K2V3Detector(), self.tools, chunks)
-        self._assert_single_weather(normal, calls, {"city": "Tokyo"})
-
-    def test_first_param_item_is_name_only(self):
-        det = K2V3Detector()
-        # Send the name-bearing prefix, then the rest.
-        det.parse_streaming_increment("<ifm|tool_call>get_weather", self.tools)
-        first = det.parse_streaming_increment(
-            "<ifm|arg_key>city</ifm|arg_key>", self.tools
-        )
-        # The name item is emitted with empty parameters before any args.
-        name_items = [c for c in first.calls if c.name]
-        self.assertTrue(any(c.name == "get_weather" for c in name_items))
-        self.assertTrue(all(c.parameters == "" for c in name_items))
-
-    def test_split_at_awkward_tag_boundaries(self):
-        chunks = [
-            "<ifm|tool_call>get_wea",
-            "ther<ifm|arg_",
-            "key>city</ifm|arg_key><ifm|arg_value>To",
-            "kyo</ifm|arg_value></ifm|tool_call>",
-        ]
-        normal, calls = _collect_stream(K2V3Detector(), self.tools, chunks)
-        self._assert_single_weather(normal, calls, {"city": "Tokyo"})
-
-    def test_schema_typed_integer(self):
-        block = (
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>days</ifm|arg_key><ifm|arg_value>3</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        normal, calls = _collect_stream(K2V3Detector(), self.tools, list(block))
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(json.loads(calls[0]["parameters"]), {"days": 3})
-
-    def test_no_args(self):
-        block = "<ifm|tool_call>get_weather</ifm|tool_call>"
-        normal, calls = _collect_stream(K2V3Detector(), self.tools, list(block))
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["name"], "get_weather")
-        self.assertEqual(json.loads(calls[0]["parameters"]), {})
-
-    def test_empty_value_object_typed_stays_valid_json(self):
-        # An empty <ifm|arg_value></ifm|arg_value> on a non-string (array) type is
-        # malformed input; streaming must still reassemble to parseable JSON.
-        tools = [_make_tool("todo", {"type": "object", "properties": {"items": {"type": "array"}}})]
-        block = (
-            "<ifm|tool_call>todo"
-            "<ifm|arg_key>items</ifm|arg_key><ifm|arg_value></ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        normal, calls = _collect_stream(K2V3Detector(), tools, list(block))
-        self.assertEqual(len(calls), 1)
-        # Reassembles to valid JSON (does not produce '{"items": }').
-        self.assertEqual(json.loads(calls[0]["parameters"]), {"items": ""})
-
-    def test_multiple_calls_separate_chunks(self):
-        chunk_a = (
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        chunk_b = (
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Osaka</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        normal, calls = _collect_stream(
-            K2V3Detector(), self.tools, [chunk_a, chunk_b]
-        )
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(json.loads(calls[0]["parameters"]), {"city": "Tokyo"})
-        self.assertEqual(json.loads(calls[1]["parameters"]), {"city": "Osaka"})
-
-    def test_multiple_calls_same_chunk(self):
-        combined = (
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>"
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Osaka</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        normal, calls = _collect_stream(K2V3Detector(), self.tools, [combined])
-        self.assertEqual(normal, "")
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(json.loads(calls[0]["parameters"]), {"city": "Tokyo"})
-        self.assertEqual(json.loads(calls[1]["parameters"]), {"city": "Osaka"})
-
-    def test_multiple_calls_char_by_char(self):
-        combined = (
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>"
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Osaka</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        normal, calls = _collect_stream(K2V3Detector(), self.tools, list(combined))
-        self.assertEqual([c["name"] for c in calls], ["get_weather", "get_weather"])
-        self.assertEqual(json.loads(calls[0]["parameters"]), {"city": "Tokyo"})
-        self.assertEqual(json.loads(calls[1]["parameters"]), {"city": "Osaka"})
-
-    def test_reasoning_prefix_and_wrapper_stripped(self):
-        wire = (
-            "<ifm|think>need lookup</ifm|think>\n"
-            "<ifm|tool_calls>\n"
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>\n"
-            "</ifm|tool_calls>"
-        )
-        normal, calls = _collect_stream(K2V3Detector(), self.tools, list(wire))
-        # No reasoning text or structural tokens leak; only incidental
-        # boundary whitespace may pass through when fed character-by-character.
-        self.assertEqual(normal.strip(), "")
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["name"], "get_weather")
-        self.assertEqual(json.loads(calls[0]["parameters"]), {"city": "Tokyo"})
-
-    def test_normal_text_before_tool_call_is_emitted(self):
-        wire = "Sure, let me check.<ifm|tool_call>get_weather</ifm|tool_call>"
-        normal, calls = _collect_stream(K2V3Detector(), self.tools, list(wire))
-        self.assertEqual(normal, "Sure, let me check.")
-        self.assertEqual(calls[0]["name"], "get_weather")
-
-    def test_whitespace_before_tool_call_is_emitted(self):
-        wire = "\n<ifm|tool_call>get_weather</ifm|tool_call>"
-        normal, calls = _collect_stream(K2V3Detector(), self.tools, list(wire))
-        self.assertEqual(normal, "\n")
-        self.assertEqual(calls[0]["name"], "get_weather")
-
-    def test_normal_text_after_tool_call_is_buffered(self):
-        det = K2V3Detector()
-        first = det.parse_streaming_increment(
-            f"Before {self.block}After", self.tools
-        )
-        self.assertEqual(first.normal_text, "Before ")
-        self.assertTrue(any(call.name == "get_weather" for call in first.calls))
-
-        second = det.parse_streaming_increment(" later", self.tools)
-        self.assertEqual(second.normal_text, "After later")
-        self.assertEqual(second.calls, [])
-
-    def test_normal_text_between_tool_calls_splits_results(self):
-        det = K2V3Detector()
-        block_b = (
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Osaka</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        first = det.parse_streaming_increment(
-            f"{self.block}Between{block_b}", self.tools
-        )
-        self.assertEqual(first.normal_text, "")
-        self.assertEqual(
-            [call.name for call in first.calls if call.name], ["get_weather"]
-        )
-
-        second = det.parse_streaming_increment("Tail", self.tools)
-        self.assertEqual(second.normal_text, "Between")
-        self.assertEqual(
-            [call.name for call in second.calls if call.name], ["get_weather"]
-        )
-
-        third = det.parse_streaming_increment(" done", self.tools)
-        self.assertEqual(third.normal_text, "Tail done")
-        self.assertEqual(third.calls, [])
-
-
-class TestK2V3XmlTypedStreaming(unittest.TestCase):
-    """The inline <ifm|arg_type> hint forces a value's type while streaming."""
-
-    def test_inline_string_keeps_numeric_as_string(self):
-        det = K2V3Detector(tool_format="xml_typed")
-        tools = [_make_tool("study_args")]
-        block = (
-            "<ifm|tool_call>study_args"
-            "<ifm|arg_key>user_id</ifm|arg_key>"
-            "<ifm|arg_type>string</ifm|arg_type>"
-            "<ifm|arg_value>12345</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        normal, calls = _collect_stream(det, tools, list(block))
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(json.loads(calls[0]["parameters"]), {"user_id": "12345"})
-        # Matches the non-stream coercion.
-        nonstream = K2V3Detector(tool_format="xml_typed").detect_and_parse(
-            block, tools
-        )
-        self.assertEqual(
-            json.loads(calls[0]["parameters"]),
-            json.loads(nonstream.calls[0].parameters),
-        )
-
-    def test_inline_any_preserves_argument_whitespace(self):
-        det = K2V3Detector(tool_format="xml_typed")
-        tools = [_make_tool("study_args")]
-        block = (
-            "<ifm|tool_call>study_args"
-            "<ifm|arg_key>notes</ifm|arg_key>"
-            "<ifm|arg_type>any</ifm|arg_type>"
-            "<ifm|arg_value>\nkeep me\n</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        normal, calls = _collect_stream(det, tools, list(block))
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(
-            json.loads(calls[0]["parameters"]), {"notes": "\nkeep me\n"}
-        )
-
-
-class TestK2V3JsonStreaming(unittest.TestCase):
-    """The IFM json dialect streams at tool-call-block granularity."""
-
-    def setUp(self):
-        self.tools = [_make_tool("get_weather")]
-
-    def test_single_object_block(self):
-        det = K2V3Detector(tool_format="json")
-        block = (
-            "<ifm|tool_call>"
-            '{"name": "get_weather", "arguments": {"city": "Tokyo"}}'
-            "</ifm|tool_call>"
-        )
-        normal, calls = _collect_stream(det, self.tools, list(block))
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["name"], "get_weather")
-        self.assertEqual(json.loads(calls[0]["parameters"]), {"city": "Tokyo"})
-
-    def test_emits_only_after_block_completes(self):
-        det = K2V3Detector(tool_format="json")
-        # Partial block: nothing emitted yet.
-        partial = det.parse_streaming_increment(
-            '<ifm|tool_call>{"name": "get_weather", "argum', self.tools
-        )
+        partial = detector.parse_streaming_increment(grouped[:-1], TOOLS)
         self.assertEqual(partial.calls, [])
-        # Completing the block emits the call.
-        rest = det.parse_streaming_increment(
-            'ents": {"city": "Tokyo"}}</ifm|tool_call>', self.tools
-        )
-        names = [c.name for c in rest.calls if c.name]
-        self.assertIn("get_weather", names)
+        completed = detector.parse_streaming_increment(grouped[-1], TOOLS)
+        self.assertEqual([call.name for call in completed.calls], ["get_weather"])
+        self.assertEqual(json.loads(completed.calls[0].parameters), {"city": "Tokyo"})
 
-    def test_list_of_tool_calls(self):
-        det = K2V3Detector(tool_format="json")
-        block = (
-            "<ifm|tool_call>"
-            '[{"name": "get_weather", "arguments": {"city": "Tokyo"}},'
-            ' {"name": "get_weather", "arguments": {"city": "Osaka"}}]'
-            "</ifm|tool_call>"
-        )
-        normal, calls = _collect_stream(det, self.tools, list(block))
-        self.assertEqual([c["name"] for c in calls], ["get_weather", "get_weather"])
-        self.assertEqual(json.loads(calls[0]["parameters"]), {"city": "Tokyo"})
-        self.assertEqual(json.loads(calls[1]["parameters"]), {"city": "Osaka"})
-
-
-class TestK2V3StreamingRegistry(unittest.TestCase):
-    """FunctionCallParser('k2_v3') streams tool calls end-to-end."""
-
-    def test_parse_stream_chunk_streams(self):
+    def test_function_call_parser_registry_and_streaming(self):
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
-        tools = [_make_tool("get_weather")]
         parser = FunctionCallParser(
-            tools=tools,
-            tool_call_parser="k2_v3",
-            chat_template_kwargs={"tool_call_format": "xml"},
-        )
-        block = (
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>"
-        )
-        name = None
-        params = ""
-        for ch in list(block):
-            _, calls = parser.parse_stream_chunk(ch)
-            for c in calls:
-                if c.name:
-                    name = c.name
-                if c.parameters:
-                    params += c.parameters
-        self.assertEqual(name, "get_weather")
-        self.assertEqual(json.loads(params), {"city": "Tokyo"})
-
-
-class TestK2V3RegistryWiring(unittest.TestCase):
-    """FunctionCallParser resolves 'k2_v3' to K2V3Detector end-to-end."""
-
-    def test_registry_builds_k2v3_detector(self):
-        from sglang.srt.function_call.function_call_parser import FunctionCallParser
-
-        tools = [_make_tool("get_weather")]
-        parser = FunctionCallParser(
-            tools=tools,
+            tools=TOOLS,
             tool_call_parser="k2_v3",
             chat_template_kwargs={"tool_call_format": "xml"},
         )
         self.assertIsInstance(parser.detector, K2V3Detector)
-        self.assertEqual(parser.detector.tool_format, "xml")
 
-    def test_registry_uses_tool_call_format_dialects_from_template(self):
+        streamed_calls = []
+        for chunk in GROUPED_CALL_1:
+            _, calls = parser.parse_stream_chunk(chunk)
+            streamed_calls.extend(calls)
+        self.assertEqual([call.name for call in streamed_calls], ["get_weather"])
+        self.assertEqual(json.loads(streamed_calls[0].parameters), {"city": "Tokyo"})
+
+        parser = FunctionCallParser(tools=TOOLS, tool_call_parser="k2_v3")
+        normal_text, calls = parser.parse_non_stream(GROUPED_CALL_1)
+        self.assertEqual(normal_text, "")
+        self.assertEqual([call.name for call in calls], ["get_weather"])
+
+    def test_function_call_parser_dialect_and_alias_validation(self):
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
-        tools = [_make_tool("get_weather")]
-        cases = {
-            "json": (
-                '<ifm|tool_call>{"name": "get_weather", '
-                '"arguments": {"city": "Tokyo"}}</ifm|tool_call>'
-            ),
-            "xml_typed": (
-                "<ifm|tool_call>get_weather"
-                "<ifm|arg_key>city</ifm|arg_key>"
-                "<ifm|arg_type>string</ifm|arg_type>"
-                "<ifm|arg_value>Tokyo</ifm|arg_value>"
-                "</ifm|tool_call>"
-            ),
-        }
-
-        for dialect, wire_output in cases.items():
-            with self.subTest(dialect=dialect):
-                parser = FunctionCallParser(
-                    tools=tools,
-                    tool_call_parser="k2_v3",
-                    chat_template_kwargs={"tool_call_format": dialect},
-                )
-                self.assertIsInstance(parser.detector, K2V3Detector)
-                self.assertEqual(parser.detector.tool_format, dialect)
-
-                normal_text, calls = parser.parse_non_stream(wire_output)
-                self.assertIsNone(normal_text)
-                self.assertEqual(len(calls), 1)
-                self.assertEqual(calls[0].name, "get_weather")
-                self.assertEqual(json.loads(calls[0].parameters), {"city": "Tokyo"})
-
-    def test_registry_rejects_alias_format_kwargs(self):
-        from sglang.srt.function_call.function_call_parser import FunctionCallParser
-
-        tools = [_make_tool("get_weather")]
-        for key in ("tool_format", "tool_calling_format"):
-            with self.subTest(key=key):
-                with self.assertRaisesRegex(
-                    ValueError, f"Unsupported argument: {key}"
-                ):
-                    FunctionCallParser(
-                        tools=tools,
-                        tool_call_parser="k2_v3",
-                        chat_template_kwargs={key: "json"},
-                    )
-
-    def test_full_pipeline_non_stream(self):
-        from sglang.srt.function_call.function_call_parser import FunctionCallParser
-
-        tools = [_make_tool("get_weather")]
-        parser = FunctionCallParser(tools=tools, tool_call_parser="k2_v3")
-        wire_output = (
-            "<ifm|think>looking it up</ifm|think>"
-            "<ifm|tool_call>get_weather"
-            "<ifm|arg_key>city</ifm|arg_key><ifm|arg_value>Tokyo</ifm|arg_value>"
-            "</ifm|tool_call>"
+        parser = FunctionCallParser(
+            tools=TOOLS,
+            tool_call_parser="k2_v3",
+            chat_template_kwargs={"tool_call_format": "json"},
         )
-        normal_text, calls = parser.parse_non_stream(wire_output)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0].name, "get_weather")
-        self.assertEqual(json.loads(calls[0].parameters), {"city": "Tokyo"})
-        self.assertIsNone(normal_text)
+        self.assertEqual(parser.detector.tool_format, "json")
+
+        for alias in ("tool_format", "tool_calling_format"):
+            with self.subTest(alias=alias), self.assertRaisesRegex(
+                ValueError, f"Unsupported argument: {alias}"
+            ):
+                FunctionCallParser(
+                    tools=TOOLS,
+                    tool_call_parser="k2_v3",
+                    chat_template_kwargs={alias: "json"},
+                )
 
 
 if __name__ == "__main__":

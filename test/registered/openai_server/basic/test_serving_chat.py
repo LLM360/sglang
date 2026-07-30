@@ -344,6 +344,500 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertTrue(tool_deltas)
         self.assertEqual(tool_deltas[0][0]["function"]["name"], "get_weather")
 
+    def test_k2v3_nonstreaming_requires_a_valid_closed_plural_wrapper(self):
+        self.chat.tool_call_parser = "k2_v3"
+        tools = ChatCompletionRequest(
+            model="x",
+            messages=[],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        ).tools
+        singular = "<ifm|tool_call>get_weather</ifm|tool_call>"
+        invalid_group = (
+            "Content <ifm|tool_calls><ifm|tool_call>get_weather"
+            "</ifm|tool_calls> suffix"
+        )
+        for output in (singular, invalid_group):
+            with self.subTest(output=output):
+                result = self.chat._process_tool_calls(
+                    output,
+                    tools,
+                    {"type": "stop", "matched": None},
+                    tool_choice="auto",
+                    chat_template_kwargs={"tool_call_format": "xml"},
+                )
+                self.assertFalse(result.tool_calls)
+                self.assertEqual(result.remaining_text, output)
+                self.assertEqual(result.finish_reason["type"], "stop")
+
+        grouped = f"<ifm|tool_calls>{singular}</ifm|tool_calls>"
+        result = self.chat._process_tool_calls(
+            grouped,
+            tools,
+            {"type": "stop", "matched": None},
+            tool_choice="auto",
+            chat_template_kwargs={"tool_call_format": "xml"},
+        )
+        self.assertEqual(result.remaining_text, "")
+        self.assertEqual(result.finish_reason["type"], "tool_calls")
+        self.assertEqual(result.tool_calls[0].function.name, "get_weather")
+
+        result = self.chat._process_tool_calls(
+            grouped,
+            tools,
+            {"type": "length", "matched": None},
+            tool_choice="auto",
+            chat_template_kwargs={"tool_call_format": "xml"},
+        )
+        self.assertEqual(result.remaining_text, "")
+        self.assertEqual(result.finish_reason["type"], "tool_calls")
+        self.assertEqual(result.tool_calls[0].function.name, "get_weather")
+
+    def test_k2v3_streaming_reasoning_and_tool_boundary_matrix(self):
+        """Port the serving-path matrix from LLM360/vllm PR #12."""
+        tool_call = (
+            "<ifm|tool_calls>"
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>city</ifm|arg_key>"
+            "<ifm|arg_value>Tokyo</ifm|arg_value>"
+            "</ifm|tool_call>"
+            "</ifm|tool_calls>"
+        )
+        singular_tool_call = tool_call.removeprefix("<ifm|tool_calls>").removesuffix(
+            "</ifm|tool_calls>"
+        )
+        cases = [
+            (
+                "same_delta",
+                [(f"</ifm|think>\n{tool_call}", "stop")],
+                "\n",
+                [""],
+                "tool_calls",
+            ),
+            (
+                "split_deltas",
+                [("</ifm|think>", None), (f"\n{tool_call}", "stop")],
+                "\n",
+                [""],
+                "tool_calls",
+            ),
+            (
+                "missing_close_stop",
+                [(tool_call, "stop")],
+                "",
+                [""],
+                "tool_calls",
+            ),
+            (
+                "missing_close_length",
+                [(tool_call, "length")],
+                "",
+                [""],
+                "tool_calls",
+            ),
+            (
+                "missing_close_reasoning_and_tool",
+                [(f"Need lookup. {tool_call}", "stop")],
+                "",
+                ["Need lookup. "],
+                "tool_calls",
+            ),
+            (
+                "plain_missing_close_stop",
+                [("Plain answer ", None), ("without close.", "stop")],
+                "Plain answer without close.",
+                [""],
+                "stop",
+            ),
+            (
+                "plain_missing_close_length",
+                [("Plain answer ", None), ("without close.", "length")],
+                "Plain answer without close.",
+                [""],
+                "length",
+            ),
+            (
+                "missing_close_incomplete_length",
+                [
+                    (
+                        "Need lookup. <ifm|tool_calls>" "<ifm|tool_call>get_weather",
+                        "length",
+                    )
+                ],
+                "<ifm|tool_calls><ifm|tool_call>get_weather",
+                ["Need lookup. "],
+                "length",
+            ),
+            (
+                "explicit_close_incomplete_tool_is_content",
+                [
+                    (
+                        "Need lookup.</ifm|think><ifm|tool_calls>"
+                        "<ifm|tool_call>get_weather",
+                        "stop",
+                    )
+                ],
+                "<ifm|tool_calls><ifm|tool_call>get_weather",
+                ["Need lookup."],
+                "stop",
+            ),
+            (
+                "delayed_explicit_close",
+                [
+                    (f"Maybe {tool_call}", None),
+                    (f" reconsider</ifm|think>{tool_call}", "stop"),
+                ],
+                "",
+                [f"Maybe {tool_call} reconsider"],
+                "tool_calls",
+            ),
+            (
+                "multiple_close_tokens",
+                [("Need lookup.</ifm|think></ifm|think>Answer", "stop")],
+                "</ifm|think>Answer",
+                ["Need lookup."],
+                "stop",
+            ),
+            (
+                "singular_tool_tag_remains_content",
+                [(f"Need lookup. {singular_tool_call}", "stop")],
+                f"Need lookup. {singular_tool_call}",
+                [""],
+                "stop",
+            ),
+        ]
+
+        for (
+            name,
+            model_deltas,
+            expected_content,
+            expected_reasoning,
+            expected_finish,
+        ) in cases:
+            with self.subTest(name=name):
+                self.chat.reasoning_parser = "k2_v3"
+                self.chat.tool_call_parser = "k2_v3"
+                self.template_manager.force_reasoning = False
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Weather?"}],
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"city": {"type": "string"}},
+                                },
+                            },
+                        }
+                    ],
+                    tool_choice="auto",
+                    stream=True,
+                    chat_template_kwargs={"tool_call_format": "xml"},
+                )
+
+                async def generate():
+                    cumulative_text = ""
+                    for delta_text, finish_type in model_deltas:
+                        cumulative_text += delta_text
+                        yield {
+                            "text": cumulative_text,
+                            "meta_info": {
+                                "id": "chatcmpl-test",
+                                "prompt_tokens": 1,
+                                "completion_tokens": len(cumulative_text),
+                                "reasoning_tokens": 0,
+                                "cached_tokens": 0,
+                                "finish_reason": (
+                                    {"type": finish_type, "matched": None}
+                                    if finish_type
+                                    else None
+                                ),
+                            },
+                            "index": 0,
+                        }
+
+                self.tm.generate_request.return_value = generate()
+
+                async def collect_chunks():
+                    return [
+                        chunk
+                        async for chunk in self.chat._generate_chat_stream(
+                            GenerateReqInput(input_ids=[1], stream=True),
+                            request,
+                            self.fastapi_request,
+                        )
+                    ]
+
+                chunks = get_or_create_event_loop().run_until_complete(collect_chunks())
+                payloads = [
+                    json.loads(chunk[len("data: ") :])
+                    for chunk in chunks
+                    if chunk.startswith("data: {")
+                ]
+                choices = [
+                    payload["choices"][0] for payload in payloads if payload["choices"]
+                ]
+                reasoning = [
+                    choice["delta"]["reasoning_content"]
+                    for choice in choices
+                    if choice["delta"].get("reasoning_content") is not None
+                ]
+                content = "".join(
+                    choice["delta"].get("content") or "" for choice in choices
+                )
+                finish = next(
+                    choice["finish_reason"]
+                    for choice in choices
+                    if choice["finish_reason"] is not None
+                )
+                tool_calls = [
+                    tool
+                    for choice in choices
+                    for tool in choice["delta"].get("tool_calls") or []
+                ]
+
+                self.assertEqual(reasoning, expected_reasoning)
+                self.assertEqual(content, expected_content)
+                self.assertEqual(finish, expected_finish)
+                if expected_finish == "tool_calls":
+                    self.assertEqual(len(tool_calls), 1)
+                    self.assertEqual(tool_calls[0]["function"]["name"], "get_weather")
+                    self.assertEqual(
+                        json.loads(tool_calls[0]["function"]["arguments"]),
+                        {"city": "Tokyo"},
+                    )
+                else:
+                    self.assertEqual(tool_calls, [])
+
+    def test_k2v3_streaming_abort_does_not_finalize_held_output(self):
+        self.chat.reasoning_parser = "k2_v3"
+        self.chat.tool_call_parser = "k2_v3"
+        self.template_manager.force_reasoning = False
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            stream=True,
+            chat_template_kwargs={"tool_call_format": "xml"},
+        )
+
+        async def generate():
+            yield {
+                "text": "<ifm|tool_calls><ifm|tool_call>get_weather",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "reasoning_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "message": "aborted",
+                    },
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = generate()
+
+        async def collect_chunks():
+            return [
+                chunk
+                async for chunk in self.chat._generate_chat_stream(
+                    GenerateReqInput(input_ids=[1], stream=True),
+                    request,
+                    self.fastapi_request,
+                )
+            ]
+
+        chunks = get_or_create_event_loop().run_until_complete(collect_chunks())
+        payloads = [
+            json.loads(chunk[len("data: ") :])
+            for chunk in chunks
+            if chunk.startswith("data: {")
+        ]
+        self.assertFalse(
+            any(
+                choice["delta"].get("reasoning_content")
+                or choice["delta"].get("content")
+                or choice["delta"].get("tool_calls")
+                for payload in payloads
+                for choice in payload.get("choices", [])
+            )
+        )
+
+    def test_k2v3_forced_tool_streaming_drains_terminal_json(self):
+        """Required and named tools must emit complete arguments at the boundary."""
+        forced_output_cases = [
+            (
+                "required_same_delta",
+                "required",
+                [
+                    (
+                        "</ifm|think>",
+                        '[{"name":"get_weather","parameters":{"city":"Tokyo"}}]',
+                        "stop",
+                    )
+                ],
+                {"city": "Tokyo"},
+            ),
+            (
+                "required_split_deltas",
+                "required",
+                [
+                    ("</ifm|think>", "", None),
+                    (
+                        "",
+                        '[{"name":"get_weather","parameters":{"city":"Tokyo"}}]',
+                        "stop",
+                    ),
+                ],
+                {"city": "Tokyo"},
+            ),
+            (
+                "named_same_delta",
+                {"type": "function", "function": {"name": "get_weather"}},
+                [
+                    (
+                        "</ifm|think>",
+                        '[{"name":"get_weather","parameters":{"city":"Tokyo"}}]',
+                        "stop",
+                    )
+                ],
+                {"city": "Tokyo"},
+            ),
+            (
+                "named_split_deltas",
+                {"type": "function", "function": {"name": "get_weather"}},
+                [
+                    ("</ifm|think>", "", None),
+                    (
+                        "",
+                        '[{"name":"get_weather","parameters":{"city":"Tokyo"}}]',
+                        "stop",
+                    ),
+                ],
+                {"city": "Tokyo"},
+            ),
+            (
+                "required_empty_arguments",
+                "required",
+                [("</ifm|think>", '[{"name":"get_weather","parameters":{}}]', "stop")],
+                {},
+            ),
+        ]
+
+        for name, tool_choice, model_deltas, expected_arguments in forced_output_cases:
+            with self.subTest(name=name):
+                self.chat.reasoning_parser = "k2_v3"
+                self.chat.tool_call_parser = "k2_v3"
+                self.template_manager.force_reasoning = False
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Weather?"}],
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"city": {"type": "string"}},
+                                },
+                            },
+                        }
+                    ],
+                    tool_choice=tool_choice,
+                    stream=True,
+                )
+
+                async def generate():
+                    cumulative_text = ""
+                    for reasoning_delta, tool_delta, finish_type in model_deltas:
+                        cumulative_text += reasoning_delta + tool_delta
+                        yield {
+                            "text": cumulative_text,
+                            "meta_info": {
+                                "id": "chatcmpl-test",
+                                "prompt_tokens": 1,
+                                "completion_tokens": len(cumulative_text),
+                                "reasoning_tokens": 0,
+                                "cached_tokens": 0,
+                                "finish_reason": (
+                                    {"type": finish_type, "matched": None}
+                                    if finish_type
+                                    else None
+                                ),
+                            },
+                            "index": 0,
+                        }
+
+                self.tm.generate_request.return_value = generate()
+
+                async def collect_chunks():
+                    return [
+                        chunk
+                        async for chunk in self.chat._generate_chat_stream(
+                            GenerateReqInput(input_ids=[1], stream=True),
+                            request,
+                            self.fastapi_request,
+                        )
+                    ]
+
+                chunks = get_or_create_event_loop().run_until_complete(collect_chunks())
+                payloads = [
+                    json.loads(chunk[len("data: ") :])
+                    for chunk in chunks
+                    if chunk.startswith("data: {")
+                ]
+                choices = [
+                    payload["choices"][0] for payload in payloads if payload["choices"]
+                ]
+
+                streamed_calls = {}
+                for choice in choices:
+                    for tool_call in choice["delta"].get("tool_calls") or []:
+                        call = streamed_calls.setdefault(
+                            tool_call["index"], {"name": None, "arguments": ""}
+                        )
+                        function = tool_call["function"]
+                        if function.get("name") is not None:
+                            call["name"] = function["name"]
+                        call["arguments"] += function.get("arguments") or ""
+
+                self.assertEqual(list(streamed_calls), [0])
+                self.assertEqual(streamed_calls[0]["name"], "get_weather")
+                self.assertEqual(
+                    json.loads(streamed_calls[0]["arguments"]), expected_arguments
+                )
+                self.assertEqual(
+                    next(
+                        choice["finish_reason"]
+                        for choice in choices
+                        if choice["finish_reason"] is not None
+                    ),
+                    "tool_calls",
+                )
+
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
 

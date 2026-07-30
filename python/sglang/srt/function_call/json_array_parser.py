@@ -42,6 +42,38 @@ class JsonArrayParser(BaseFormatDetector):
         """
         return super().parse_streaming_increment(new_text, tools)
 
+    def finalize_streaming(self, tools: List[Tool]) -> StreamingParseResult:
+        """Drain complete JSON calls still buffered in the terminal engine delta."""
+        normal_text = ""
+        calls = []
+
+        # BaseFormatDetector emits a call's name and arguments on separate
+        # invocations. A terminal engine delta can contain the entire JSON
+        # array, so keep parsing the existing buffer until no state changes.
+        max_steps = 2 * (self._buffer.count(self.tool_call_separator) + 1) + 2
+        for _ in range(max_steps):
+            before = (
+                self._buffer,
+                self.current_tool_id,
+                self.current_tool_name_sent,
+                tuple(self.streamed_args_for_tool),
+                repr(self.prev_tool_call_arr),
+            )
+            result = super().parse_streaming_increment("", tools)
+            normal_text += result.normal_text or ""
+            calls.extend(result.calls)
+            after = (
+                self._buffer,
+                self.current_tool_id,
+                self.current_tool_name_sent,
+                tuple(self.streamed_args_for_tool),
+                repr(self.prev_tool_call_arr),
+            )
+            if after == before:
+                break
+
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
     def structure_info(self) -> callable:
         """
         Return a function that creates StructureInfo for constrained generation.

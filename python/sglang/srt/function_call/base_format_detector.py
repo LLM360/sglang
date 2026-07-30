@@ -270,7 +270,7 @@ class BaseFormatDetector(ABC):
                 cur_arguments = current_tool_call.get("arguments")
                 res = StreamingParseResult()
 
-                if cur_arguments:
+                if cur_arguments is not None:
                     # Calculate how much of the arguments we've already streamed
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
                     cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
@@ -343,6 +343,14 @@ class BaseFormatDetector(ABC):
         Check if the given text contains function call markers specific to this format.
         """
         raise NotImplementedError()
+
+    def finalize_streaming(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release text held by the parser after normal model completion."""
+        return StreamingParseResult()
+
+    def has_pending_streaming_output(self) -> bool:
+        """Return whether source text is held without a complete output delta."""
+        return False
 
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""

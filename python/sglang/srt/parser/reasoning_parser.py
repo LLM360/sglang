@@ -1,7 +1,13 @@
-from typing import Dict, Optional, Tuple, Type
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, Type, Union
 
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    ResponsesRequest,
+)
 from sglang.srt.parser.harmony_parser import HarmonyParser
+
+_UNSET = object()
 
 
 class StreamingParseResult:
@@ -9,11 +15,23 @@ class StreamingParseResult:
 
     def __init__(
         self,
-        normal_text: Optional[str] = None,
-        reasoning_text: Optional[str] = None,
+        normal_text: object = _UNSET,
+        reasoning_text: object = _UNSET,
     ):
-        self.normal_text = normal_text or ""
-        self.reasoning_text = reasoning_text or ""
+        self.has_normal_text = normal_text is not _UNSET
+        self.has_reasoning_text = reasoning_text is not _UNSET
+        self.normal_text = (
+            "" if normal_text is _UNSET or normal_text is None else normal_text
+        )
+        self.reasoning_text = (
+            "" if reasoning_text is _UNSET or reasoning_text is None else reasoning_text
+        )
+
+
+@dataclass
+class ReasoningParserStreamingFinalization:
+    result: Optional[StreamingParseResult]
+    reasoning_ended: bool
 
 
 class BaseReasoningFormatDetector:
@@ -167,6 +185,11 @@ class BaseReasoningFormatDetector:
             return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult()
+
+    def finalize_reasoning_streaming(
+        self,
+    ) -> Optional[ReasoningParserStreamingFinalization]:
+        return None
 
 
 class DeepSeekR1Detector(BaseReasoningFormatDetector):
@@ -488,7 +511,7 @@ class K2V3Detector(BaseReasoningFormatDetector):
       - medium:         <ifm|think_fast> / </ifm|think_fast>
       - low:            <ifm|think_faster> / </ifm|think_faster>
 
-    A tool call begins with ``<ifm|tool_call>``; when the model emits one
+    A tool section begins with ``<ifm|tool_calls>``; when the model emits one
     without first closing the think block, reasoning is split at that boundary.
 
     The chat template inserts the start token into the prompt, so the
@@ -506,9 +529,9 @@ class K2V3Detector(BaseReasoningFormatDetector):
         "low": ("<ifm|think_faster>", "</ifm|think_faster>"),
     }
 
-    # Boundary that ends reasoning when a tool call is emitted before the think
-    # end token.
-    _TOOL_START_TOKEN: str = "<ifm|tool_call>"
+    # Boundary that ends reasoning when a tool section is emitted before the
+    # think end token.
+    _TOOL_START_TOKEN: str = "<ifm|tool_calls>"
 
     def __init__(
         self,
@@ -534,6 +557,67 @@ class K2V3Detector(BaseReasoningFormatDetector):
             tool_start_token=self._TOOL_START_TOKEN,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+        )
+        self._streaming_state = "reasoning" if self._in_reasoning else "content"
+        self._streaming_reasoning_buffer = ""
+
+    def _strip_optional_start_token(self, text: str) -> str:
+        if self.think_start_token in text:
+            _, _, text = text.partition(self.think_start_token)
+        return text
+
+    def _split_model_output(self, text: str) -> tuple[str, str]:
+        text = self._strip_optional_start_token(text)
+        if self.think_end_token in text:
+            reasoning, _, content = text.partition(self.think_end_token)
+            return reasoning, content
+        if self._TOOL_START_TOKEN in text:
+            reasoning, marker, content = text.partition(self._TOOL_START_TOKEN)
+            return reasoning, marker + content
+        return "", text
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        reasoning, content = self._split_model_output(text)
+        return StreamingParseResult(
+            normal_text=content,
+            reasoning_text=reasoning,
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        if self._streaming_state == "content":
+            return StreamingParseResult(normal_text=new_text)
+
+        self._streaming_reasoning_buffer += new_text
+        if self.think_end_token not in self._streaming_reasoning_buffer:
+            return StreamingParseResult()
+
+        reasoning, content = self._split_model_output(self._streaming_reasoning_buffer)
+        self._streaming_reasoning_buffer = ""
+        self._streaming_state = "content"
+        self._in_reasoning = False
+        if content:
+            return StreamingParseResult(
+                normal_text=content,
+                reasoning_text=reasoning,
+            )
+        return StreamingParseResult(reasoning_text=reasoning)
+
+    def finalize_reasoning_streaming(
+        self,
+    ) -> Optional[ReasoningParserStreamingFinalization]:
+        if self._streaming_state != "reasoning":
+            return None
+
+        reasoning, content = self._split_model_output(self._streaming_reasoning_buffer)
+        self._streaming_reasoning_buffer = ""
+        self._streaming_state = "content"
+        self._in_reasoning = False
+        return ReasoningParserStreamingFinalization(
+            result=StreamingParseResult(
+                normal_text=content,
+                reasoning_text=reasoning,
+            ),
+            reasoning_ended=True,
         )
 
 
@@ -561,6 +645,14 @@ class K2V3DetectorLegacy(K2V3Detector):
     }
 
     _TOOL_START_TOKEN: str = "<tool_call>"
+
+    # Preserve the legacy detector's eager streaming behavior. The buffering
+    # and terminal classification above apply only to canonical K2 IFM output.
+    detect_and_parse = BaseReasoningFormatDetector.detect_and_parse
+    parse_streaming_increment = BaseReasoningFormatDetector.parse_streaming_increment
+    finalize_reasoning_streaming = (
+        BaseReasoningFormatDetector.finalize_reasoning_streaming
+    )
 
 
 class ReasoningParser:
@@ -600,7 +692,7 @@ class ReasoningParser:
         model_type: Optional[str] = None,
         stream_reasoning: bool = True,
         force_reasoning: Optional[bool] = None,
-        request: ChatCompletionRequest = None,
+        request: Optional[Union[ChatCompletionRequest, ResponsesRequest]] = None,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
@@ -631,15 +723,15 @@ class ReasoningParser:
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True
 
-        # K2-v3 selects its token pair via reasoning_effort. The OpenAI server
-        # pops reasoning_effort out of chat_template_kwargs and promotes it to
-        # request.reasoning_effort (see serving_chat.py); fall back to the
-        # kwargs dict for callers that bypass that normalization.
+        # K2-v3 selects its token pair via reasoning_effort. Chat Completions
+        # exposes it at the top level, while Responses nests it under reasoning.
+        # Fall back to chat_template_kwargs for callers that bypass normalization.
         if model_type.lower() in ("k2_v3", "k2_v3_legacy"):
-            effort = (
-                getattr(request, "reasoning_effort", None)
-                or chat_template_kwargs.get("reasoning_effort")
-            )
+            effort = getattr(request, "reasoning_effort", None)
+            if not effort:
+                reasoning = getattr(request, "reasoning", None)
+                effort = getattr(reasoning, "effort", None)
+            effort = effort or chat_template_kwargs.get("reasoning_effort")
             if effort:
                 kwargs["reasoning_effort"] = effort
 
@@ -656,3 +748,12 @@ class ReasoningParser:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text
+
+    def parse_stream_chunk_result(self, chunk_text: str) -> StreamingParseResult:
+        """Streaming call preserving whether empty fields were explicitly emitted."""
+        return self.detector.parse_streaming_increment(chunk_text)
+
+    def finalize_reasoning_streaming(
+        self,
+    ) -> Optional[ReasoningParserStreamingFinalization]:
+        return self.detector.finalize_reasoning_streaming()
