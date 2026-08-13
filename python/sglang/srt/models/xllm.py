@@ -225,7 +225,14 @@ def _validate_mova_config(
         raise ValueError("MoVA requires query heads to be divisible by KV heads")
     if getattr(config, "rope_head_dim", head_dim) != head_dim:
         raise ValueError("MoVA phase 1 requires full-head interleaved RoPE")
-    if getattr(config, "rope_scaling", None) is not None:
+    rope_scaling = getattr(config, "rope_scaling", None)
+    # Transformers 5 normalizes a JSON ``rope_scaling: null`` into an
+    # explicit default-RoPE dictionary.  That representation does not change
+    # the rotary math and must not be confused with linear/dynamic scaling.
+    if rope_scaling is not None and not (
+        isinstance(rope_scaling, dict)
+        and rope_scaling.get("rope_type", rope_scaling.get("type")) == "default"
+    ):
         raise ValueError("MoVA phase 1 does not support non-default RoPE scaling")
     if getattr(config, "sliding_window", None) is not None or getattr(
         config, "use_sliding_window", False
