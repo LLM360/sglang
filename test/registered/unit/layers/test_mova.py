@@ -312,6 +312,39 @@ def test_mova_config_accepts_36b_contract(monkeypatch):
     _validate_mova_config(_valid_mova_config(), quant_config=None)
 
 
+@pytest.mark.parametrize(
+    "rope_scaling",
+    [
+        {"rope_type": "default", "rope_theta": 10_000_000.0},
+        {"type": "default"},
+    ],
+)
+def test_mova_config_accepts_transformers_normalized_default_rope(
+    monkeypatch, rope_scaling
+):
+    monkeypatch.setattr(
+        "sglang.srt.models.xllm.torch.get_default_dtype", lambda: torch.bfloat16
+    )
+    monkeypatch.setattr("sglang.srt.models.xllm.get_attention_tp_size", lambda: 8)
+    _validate_mova_config(
+        _valid_mova_config(rope_scaling=rope_scaling), quant_config=None
+    )
+
+
+def test_mova_config_rejects_actual_rope_scaling(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.srt.models.xllm.torch.get_default_dtype", lambda: torch.bfloat16
+    )
+    monkeypatch.setattr("sglang.srt.models.xllm.get_attention_tp_size", lambda: 8)
+    with pytest.raises(ValueError, match="non-default RoPE scaling"):
+        _validate_mova_config(
+            _valid_mova_config(
+                rope_scaling={"rope_type": "linear", "factor": 2.0}
+            ),
+            quant_config=None,
+        )
+
+
 def test_mova_config_rejects_accidental_auto_fp16(monkeypatch):
     monkeypatch.setattr(
         "sglang.srt.models.xllm.torch.get_default_dtype", lambda: torch.float16
