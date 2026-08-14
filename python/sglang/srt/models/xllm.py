@@ -194,6 +194,99 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
+_XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY = "xllm_source_router_gemm_partitions"
+_XLLM_SOURCE_ROUTER_PARTITIONS_MISSING = object()
+
+
+def _get_xllm_source_router_gemm_partitions(
+    config: PretrainedConfig,
+) -> Optional[int]:
+    """Read optional source-router provenance without inferring it from TP."""
+
+    partitions = getattr(
+        config,
+        _XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY,
+        _XLLM_SOURCE_ROUTER_PARTITIONS_MISSING,
+    )
+    if partitions is _XLLM_SOURCE_ROUTER_PARTITIONS_MISSING:
+        return None
+    if (
+        isinstance(partitions, bool)
+        or not isinstance(partitions, int)
+        or partitions not in (1, 2)
+    ):
+        raise ValueError(
+            f"{_XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY}={partitions!r} is "
+            f"invalid (type={type(partitions).__name__}); when present it must "
+            "be the integer 1 or 2. Omit the key to preserve legacy router "
+            "GEMM behavior."
+        )
+    if config.hidden_size % partitions:
+        raise ValueError(
+            f"explicit {_XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY}={partitions} "
+            f"requires hidden_size divisible by {partitions}; got "
+            f"hidden_size={config.hidden_size}"
+        )
+    return partitions
+
+
+def _xllm_router_gemm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    source_partitions: Optional[int],
+) -> torch.Tensor:
+    """Reproduce the source xLLM router GEMM's partition rounding contract."""
+
+    # Old xLLM artifacts have no source-topology provenance. Preserve their
+    # exact pre-contract behavior instead of guessing how the router was run.
+    if source_partitions is None:
+        return F.linear(hidden_states, weight)
+    if isinstance(source_partitions, bool) or not isinstance(source_partitions, int):
+        raise ValueError(
+            "explicit xLLM router source partitions must be the integer 1 or "
+            f"2; got {source_partitions!r} "
+            f"(type={type(source_partitions).__name__})"
+        )
+    if source_partitions not in (1, 2):
+        raise ValueError(
+            "explicit xLLM router source partitions must be 1 or 2, got "
+            f"{source_partitions}"
+        )
+    if hidden_states.ndim < 1 or weight.ndim != 2:
+        raise ValueError(
+            "xLLM router GEMM expects input [..., hidden] and weight "
+            f"[routes, hidden]; got input={tuple(hidden_states.shape)}, "
+            f"weight={tuple(weight.shape)}"
+        )
+    if hidden_states.shape[-1] != weight.shape[-1]:
+        raise ValueError(
+            "xLLM router input and weight hidden dimensions differ; got "
+            f"input={tuple(hidden_states.shape)}, weight={tuple(weight.shape)}"
+        )
+    if hidden_states.shape[-1] % source_partitions:
+        raise ValueError(
+            f"explicit xLLM router partitions={source_partitions} requires "
+            f"hidden size divisible by {source_partitions}; got hidden_size="
+            f"{hidden_states.shape[-1]}"
+        )
+    if hidden_states.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        raise ValueError(
+            "Explicit xLLM source router GEMM provenance requires BF16 input "
+            f"and weight; got input={hidden_states.dtype}, weight={weight.dtype}"
+        )
+
+    if source_partitions == 1:
+        return F.linear(hidden_states, weight).float()
+
+    # Native xLLM row-shards each router across MP2. Each rank performs a BF16
+    # partial GEMM, rounds that result to BF16, casts it to FP32, and then the
+    # FP32 all-reduce adds the two partials. Emulate that ordering locally.
+    input_parts = hidden_states.chunk(source_partitions, dim=-1)
+    weight_parts = weight.chunk(source_partitions, dim=-1)
+    first = F.linear(input_parts[0].contiguous(), weight_parts[0].contiguous())
+    second = F.linear(input_parts[1].contiguous(), weight_parts[1].contiguous())
+    return first.float() + second.float()
+
 
 def _validate_mova_config(
     config: PretrainedConfig,
@@ -208,6 +301,7 @@ def _validate_mova_config(
             "MoVA phase 1 requires --dtype bfloat16. The converted 36B HF "
             "artifact reports float32, so SGLang dtype=auto would select fp16."
         )
+    _get_xllm_source_router_gemm_partitions(config)
     if quant_config is not None:
         raise ValueError("MoVA phase 1 does not support quantized model weights")
     if getattr(config, "attention_bias", False):
@@ -526,6 +620,9 @@ class XllmMoEGate(nn.Module):
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
+        self.source_router_gemm_partitions = (
+            _get_xllm_source_router_gemm_partitions(config)
+        )
         self.weight = nn.Parameter(
             torch.empty((config.num_experts, config.hidden_size))
         )
@@ -538,7 +635,9 @@ class XllmMoEGate(nn.Module):
             self.bias = None
 
     def forward(self, hidden_states: torch.Tensor):
-        return F.linear(hidden_states, self.weight)
+        return _xllm_router_gemm(
+            hidden_states, self.weight, self.source_router_gemm_partitions
+        )
 
 
 class XllmSparseMoeBlock(nn.Module):
@@ -1016,6 +1115,9 @@ class XllmMoVAAttention(_XllmMoVAAttentionBase):
         self.router_score_func = getattr(config, "router_score_func", "sigmoid")
         self.router_scaling_factor = getattr(config, "router_scaling_factor", 1.0)
         self.renormalize = getattr(config, "norm_topk_prob", True)
+        self.source_router_gemm_partitions = (
+            _get_xllm_source_router_gemm_partitions(config)
+        )
         self.v_router = ReplicatedLinear(
             config.hidden_size,
             self.num_values,
@@ -1042,7 +1144,11 @@ class XllmMoVAAttention(_XllmMoVAAttentionBase):
     def _project_value(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Router bias is deliberately omitted from the logits matmul. It only
         # changes route selection inside ``mova_router_topk``.
-        router_logits = F.linear(hidden_states, self.v_router.weight)
+        router_logits = _xllm_router_gemm(
+            hidden_states,
+            self.v_router.weight,
+            self.source_router_gemm_partitions,
+        )
         routing_weights, selected_values = mova_router_topk(
             router_logits,
             self.v_router.bias,
