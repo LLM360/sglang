@@ -422,7 +422,11 @@ def fused_topk_torch_native(
 
     if correction_bias is not None:
         n_routed_experts = gating_output.shape[-1]
-        scores = scoring_func_impl(gating_output)
+        # Keep routing scores in FP32.  In particular, xLLM computes its BF16
+        # router GEMM first, then applies sigmoid, correction bias, top-k, and
+        # renormalization in FP32.  Applying sigmoid in BF16 can change both
+        # mixture weights and expert selection near a top-k boundary.
+        scores = scoring_func_impl(gating_output.float())
         scores_for_choice = scores.view(
             -1, n_routed_experts
         ) + correction_bias.unsqueeze(0)
