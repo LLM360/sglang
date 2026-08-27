@@ -16,13 +16,19 @@ from sglang.srt.layers.mova import (
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_loader.parameter_mapper import ParameterMapper
 from sglang.srt.models.xllm import (
+    K2AuroraForCausalLM,
+    XllmForCausalLM,
     XllmGroupRMSNorm,
     XllmMoEGate,
     XllmMoVAAttention,
     XllmQKGParallelLinear,
+    _K2_AURORA_HF_CHECKPOINT_FORMAT,
+    _XLLM_CHECKPOINT_FORMAT_CONFIG_KEY,
     _XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY,
     _get_xllm_source_router_gemm_partitions,
     _interleave_rope_weight,
+    _make_norm,
+    _normalize_k2_aurora_config,
     _validate_mova_config,
     _xllm_router_gemm,
     _xllm_stacked_params_mapping,
@@ -67,6 +73,27 @@ def _valid_mova_config(**overrides):
         router_score_func="sigmoid",
         router_scaling_factor=2.5,
         layernorm_num_groups=2,
+        xllm_source_router_gemm_partitions=2,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _canonical_k2_aurora_config(**overrides):
+    values = dict(
+        architectures=["K2AuroraForCausalLM"],
+        hidden_size=2560,
+        rms_norm_eps=1e-6,
+        layernorm_num_groups=2,
+        mova_num_experts=64,
+        mova_num_experts_per_tok=4,
+        attention_gate_func="softplus",
+        rope_parameters={
+            "rope_theta": 10_000_000.0,
+            "rope_type": "default",
+        },
+        mlp_only_layers=[0, 1, 2],
+        num_hidden_layers=48,
         xllm_source_router_gemm_partitions=2,
     )
     values.update(overrides)
@@ -118,9 +145,7 @@ def _real_shape_boundary_router_case(*, num_routes, top_k, device):
     full_gemm_candidate = top_k
 
     hidden = torch.zeros(1, hidden_size, device=device, dtype=torch.bfloat16)
-    weight = torch.zeros(
-        num_routes, hidden_size, device=device, dtype=torch.bfloat16
-    )
+    weight = torch.zeros(num_routes, hidden_size, device=device, dtype=torch.bfloat16)
     hidden[0, 0] = 1.0
     hidden[0, split] = 1.0
     weight[native_candidate, 0] = 1.0
@@ -151,12 +176,10 @@ def _real_shape_boundary_router_case(*, num_routes, top_k, device):
     native_scores = torch.sigmoid(native_logits)
     full_gemm_scores = torch.sigmoid(full_gemm_logits)
     native_margin = (
-        native_scores[0, native_candidate]
-        - native_scores[0, full_gemm_candidate]
+        native_scores[0, native_candidate] - native_scores[0, full_gemm_candidate]
     )
     full_gemm_margin = (
-        full_gemm_scores[0, native_candidate]
-        - full_gemm_scores[0, full_gemm_candidate]
+        full_gemm_scores[0, native_candidate] - full_gemm_scores[0, full_gemm_candidate]
     )
     assert native_margin > full_gemm_margin
 
@@ -251,9 +274,9 @@ def test_xllm_source_router_partition_config_roundtrip(partitions, expected):
     restored = PretrainedConfig.from_dict(config.to_dict())
 
     assert _get_xllm_source_router_gemm_partitions(restored) == expected
-    assert (
-        _XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY in restored.to_dict()
-    ) == (partitions is not _MISSING_ROUTER_PROVENANCE)
+    assert (_XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY in restored.to_dict()) == (
+        partitions is not _MISSING_ROUTER_PROVENANCE
+    )
 
 
 @pytest.mark.parametrize("partitions", [None, True, 0, -1, 3, 1.5, "2"])
@@ -278,6 +301,144 @@ def test_xllm_source_router_partition_config_rejects_odd_hidden_size():
 
     with pytest.raises(ValueError, match="requires hidden_size divisible"):
         _get_xllm_source_router_gemm_partitions(config)
+
+
+def test_k2_aurora_normalizes_only_canonical_schema_aliases():
+    config = _canonical_k2_aurora_config()
+
+    _normalize_k2_aurora_config(config)
+
+    assert config.num_values == 64
+    assert config.num_values_per_tok == 4
+    assert config.attn_gate_func == "softplus"
+    assert config.apply_attn_gate is True
+    assert config.rope_theta == 10_000_000.0
+    assert config.rope_scaling == {
+        "rope_theta": 10_000_000.0,
+        "rope_type": "default",
+    }
+    assert config.num_dense_layers == 3
+    assert (
+        getattr(config, _XLLM_CHECKPOINT_FORMAT_CONFIG_KEY)
+        == _K2_AURORA_HF_CHECKPOINT_FORMAT
+    )
+    assert config.xllm_source_router_gemm_partitions == 2
+
+
+def test_k2_aurora_class_applies_adapter_before_xllm_init(monkeypatch):
+    config = _canonical_k2_aurora_config()
+    observed = {}
+
+    def fake_xllm_init(self, normalized, quant_config=None, prefix=""):
+        torch.nn.Module.__init__(self)
+        observed["config"] = normalized
+        observed["quant_config"] = quant_config
+        observed["prefix"] = prefix
+
+    monkeypatch.setattr(
+        "sglang.srt.models.xllm.XllmForCausalLM.__init__", fake_xllm_init
+    )
+
+    K2AuroraForCausalLM(config, quant_config="sentinel", prefix="model")
+
+    assert observed == {
+        "config": config,
+        "quant_config": "sentinel",
+        "prefix": "model",
+    }
+    assert config.num_values == 64
+    assert config.num_dense_layers == 3
+
+
+def test_k2_aurora_requires_explicit_router_provenance_without_guessing():
+    config = _canonical_k2_aurora_config()
+    delattr(config, _XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"K2Aurora MoVA requires explicit source router GEMM provenance.*"
+            r"--json-model-override-args.*xllm_source_router_gemm_partitions"
+        ),
+    ):
+        _normalize_k2_aurora_config(config)
+
+    assert not hasattr(config, _XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY)
+
+
+@pytest.mark.parametrize("mova_num_experts", [0, -1, None, True])
+def test_k2_aurora_rejects_unsupported_non_mova_variants(mova_num_experts):
+    config = _canonical_k2_aurora_config(mova_num_experts=mova_num_experts)
+
+    with pytest.raises(ValueError, match="supports canonical MoVA checkpoints only"):
+        _normalize_k2_aurora_config(config)
+
+
+@pytest.mark.parametrize("experts_per_tok", [0, 65, None, True])
+def test_k2_aurora_rejects_invalid_values_per_token(experts_per_tok):
+    config = _canonical_k2_aurora_config(mova_num_experts_per_tok=experts_per_tok)
+
+    with pytest.raises(ValueError, match="mova_num_experts_per_tok"):
+        _normalize_k2_aurora_config(config)
+
+
+@pytest.mark.parametrize("partitions", [1, 2])
+def test_k2_aurora_preserves_explicit_router_provenance(partitions):
+    config = _canonical_k2_aurora_config(xllm_source_router_gemm_partitions=partitions)
+
+    _normalize_k2_aurora_config(config)
+
+    assert _get_xllm_source_router_gemm_partitions(config) == partitions
+
+
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        pytest.param(
+            {"num_values": 32},
+            "conflicting mova_num_experts",
+            id="mova-count",
+        ),
+        pytest.param(
+            {"attn_gate_func": "silu"},
+            "conflicting attention_gate_func",
+            id="attention-gate",
+        ),
+        pytest.param(
+            {"num_dense_layers": 2},
+            "conflicting mlp_only_layers",
+            id="dense-prefix",
+        ),
+        pytest.param(
+            {"rope_theta": 10_000.0},
+            "conflicting rope_parameters.rope_theta",
+            id="rope-theta",
+        ),
+    ],
+)
+def test_k2_aurora_rejects_conflicting_aliases(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        _normalize_k2_aurora_config(_canonical_k2_aurora_config(**overrides))
+
+
+def test_k2_aurora_rejects_noncontiguous_dense_prefix():
+    config = _canonical_k2_aurora_config(mlp_only_layers=[0, 2])
+
+    with pytest.raises(ValueError, match="contiguous prefix"):
+        _normalize_k2_aurora_config(config)
+
+
+def test_k2_aurora_rejects_nondefault_nested_rope():
+    config = _canonical_k2_aurora_config(
+        rope_parameters={
+            "rope_theta": 10_000_000.0,
+            "rope_type": "linear",
+            "factor": 2.0,
+        }
+    )
+
+    with pytest.raises(ValueError, match="only explicit default rope_parameters"):
+        _normalize_k2_aurora_config(config)
 
 
 @pytest.mark.parametrize(
@@ -363,12 +524,8 @@ def test_ffn_top8_routes_match_native_mp2_at_real_shape_boundary(device):
     )
 
     torch.testing.assert_close(actual_logits, native_logits, rtol=0.0, atol=0.0)
-    actual_weights, actual_ids = _canonical_routes(
-        actual_weights, actual_topk.topk_ids
-    )
-    expected_weights, expected_ids = _canonical_routes(
-        expected_weights, expected_ids
-    )
+    actual_weights, actual_ids = _canonical_routes(actual_weights, actual_topk.topk_ids)
+    expected_weights, expected_ids = _canonical_routes(expected_weights, expected_ids)
     _, full_gemm_ids = _canonical_routes(expected_weights, full_gemm_ids)
     assert actual_ids.tolist() == [list(range(8))]
     assert full_gemm_ids.tolist() == [[0, 1, 2, 3, 4, 5, 6, 8]]
@@ -408,9 +565,7 @@ def test_value_top4_routes_match_native_mp2_at_real_shape_boundary(device):
     attention.v_router = torch.nn.Linear(
         2560, 64, bias=False, device=device, dtype=torch.bfloat16
     )
-    attention.v_router.bias = torch.nn.Parameter(
-        bias.clone(), requires_grad=False
-    )
+    attention.v_router.bias = torch.nn.Parameter(bias.clone(), requires_grad=False)
     with torch.no_grad():
         attention.v_router.weight.copy_(weight)
 
@@ -442,12 +597,8 @@ def test_value_top4_routes_match_native_mp2_at_real_shape_boundary(device):
     )
 
     assert seen["weights"].dtype == torch.float32
-    actual_weights, actual_ids = _canonical_routes(
-        seen["native_weights"], seen["ids"]
-    )
-    expected_weights, expected_ids = _canonical_routes(
-        expected_weights, expected_ids
-    )
+    actual_weights, actual_ids = _canonical_routes(seen["native_weights"], seen["ids"])
+    expected_weights, expected_ids = _canonical_routes(expected_weights, expected_ids)
     _, full_gemm_ids = _canonical_routes(expected_weights, full_gemm_ids)
     assert actual_ids.tolist() == [[0, 1, 2, 3]]
     assert full_gemm_ids.tolist() == [[0, 1, 2, 4]]
@@ -751,9 +902,7 @@ def test_mova_config_rejects_actual_rope_scaling(monkeypatch):
     monkeypatch.setattr("sglang.srt.models.xllm.get_attention_tp_size", lambda: 8)
     with pytest.raises(ValueError, match="non-default RoPE scaling"):
         _validate_mova_config(
-            _valid_mova_config(
-                rope_scaling={"rope_type": "linear", "factor": 2.0}
-            ),
+            _valid_mova_config(rope_scaling={"rope_type": "linear", "factor": 2.0}),
             quant_config=None,
         )
 
@@ -838,6 +987,96 @@ def test_mova_parameter_mapper_stages_qkg_and_all_value_experts():
     router = mapper.map("model.layers.3.self_attn.v_router.bias")
     assert router.sglang_name == "model.layers.3.self_attn.v_router.bias"
     assert router.num_shards == 1
+
+
+def test_k2_aurora_parameter_mapper_scopes_attention_gate_alias():
+    config = _canonical_k2_aurora_config()
+    _normalize_k2_aurora_config(config)
+    model = SimpleNamespace(
+        stacked_params_mapping=_xllm_stacked_params_mapping(config),
+        expert_params_mapping=[],
+    )
+    mapper = ParameterMapper.from_model(model)
+
+    mapped_attention_gates = set()
+    for layer_id in range(config.num_hidden_layers):
+        attention_gate = mapper.map(
+            f"model.layers.{layer_id}.self_attn.gate_proj.weight"
+        )
+        assert (
+            attention_gate.sglang_name
+            == f"model.layers.{layer_id}.self_attn.qkg_proj.weight"
+        )
+        assert attention_gate.shard_id == "gate"
+        assert attention_gate.num_shards == 3
+        mapped_attention_gates.add(attention_gate.sglang_name)
+    assert len(mapped_attention_gates) == 48
+
+    mlp_gate = mapper.map("model.layers.3.mlp.gate_proj.weight")
+    assert mlp_gate.sglang_name == "model.layers.3.mlp.gate_up_proj.weight"
+    assert mlp_gate.shard_id == 0
+    assert mlp_gate.num_shards == 2
+
+
+def test_k2_aurora_loader_does_not_silently_drop_attention_gate():
+    config = _canonical_k2_aurora_config()
+    _normalize_k2_aurora_config(config)
+    model = SimpleNamespace(
+        config=config,
+        stacked_params_mapping=_xllm_stacked_params_mapping(config),
+        expert_params_mapping=[],
+        model=SimpleNamespace(start_layer=0, end_layer=config.num_hidden_layers),
+        named_parameters=lambda: [],
+    )
+
+    with pytest.raises(RuntimeError, match="attention gate did not resolve"):
+        XllmForCausalLM.load_weights(
+            model,
+            [
+                (
+                    "model.layers.0.self_attn.gate_proj.weight",
+                    torch.empty(1),
+                )
+            ],
+        )
+
+
+def test_k2_aurora_norms_load_one_centered_weights_directly():
+    canonical_config = _canonical_k2_aurora_config()
+    _normalize_k2_aurora_config(canonical_config)
+    canonical_norm = _make_norm(canonical_config)
+
+    legacy_config = _valid_mova_config(rms_norm_eps=1e-6)
+    legacy_norm = _make_norm(legacy_config)
+
+    # Decoder input/post-attention norms and the model-final norm all use this
+    # shared factory. K2Aurora HF stores their weights around one, while the
+    # converted Xllm MoVA schema stores zero-centered deltas.
+    assert isinstance(canonical_norm, XllmGroupRMSNorm)
+    assert canonical_norm.zero_centered is False
+    torch.testing.assert_close(
+        canonical_norm.weight, torch.ones_like(canonical_norm.weight)
+    )
+    assert isinstance(legacy_norm, XllmGroupRMSNorm)
+    assert legacy_norm.zero_centered is True
+    torch.testing.assert_close(legacy_norm.weight, torch.zeros_like(legacy_norm.weight))
+
+    canonical_weight = torch.tensor([1.0, 1.5, 0.5, 2.0])
+    small_config = _canonical_k2_aurora_config(
+        hidden_size=4,
+        layernorm_num_groups=2,
+    )
+    _normalize_k2_aurora_config(small_config)
+    norm = _make_norm(small_config)
+    with torch.no_grad():
+        norm.weight.copy_(canonical_weight)
+    x = torch.tensor([[3.0, 4.0, 0.0, 5.0]])
+    grouped = x.reshape(1, 2, 2)
+    expected = grouped * torch.rsqrt(
+        grouped.pow(2).mean(-1, keepdim=True) + small_config.rms_norm_eps
+    )
+    expected = expected.reshape_as(x) * canonical_weight
+    torch.testing.assert_close(norm(x), expected)
 
 
 def test_legacy_xllm_mapping_is_unchanged():

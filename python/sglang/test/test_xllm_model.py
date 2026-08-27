@@ -1,11 +1,13 @@
 import unittest
 from collections import namedtuple
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.models.xllm import (
     EntryClass,
+    K2AuroraForCausalLM,
     XllmAttention,
     XllmForCausalLM,
     XllmGroupRMSNorm,
@@ -14,7 +16,7 @@ from sglang.srt.models.xllm import (
     permute_to_hf,
     permute_to_xllm,
 )
-
+from sglang.srt.utils import hf_transformers_utils
 
 TopKOutput = namedtuple("TopKOutput", ["topk_weights"])
 
@@ -51,6 +53,65 @@ class _IdentityRotary:
 
 
 class TestXllmModel(unittest.TestCase):
+    def test_k2_aurora_invalid_remote_config_uses_exact_native_fallback(self):
+        remote_error = hf_transformers_utils.StrictDataclassDefinitionError(
+            "remote config applied @strict to a non-dataclass"
+        )
+        raw_config = {
+            "architectures": ["K2AuroraForCausalLM"],
+            "model_type": "k2_aurora",
+            "hidden_size": 4096,
+            "xllm_source_router_gemm_partitions": 2,
+        }
+        with (
+            patch.object(
+                hf_transformers_utils.AutoConfig,
+                "from_pretrained",
+                side_effect=remote_error,
+            ),
+            patch.object(
+                hf_transformers_utils.PretrainedConfig,
+                "get_config_dict",
+                return_value=(raw_config, {}),
+            ),
+        ):
+            config = hf_transformers_utils.get_config(
+                "k2-aurora-invalid-strict-config-unit-test",
+                trust_remote_code=True,
+                model_override_args={"xllm_source_router_gemm_partitions": 2},
+            )
+
+        self.assertEqual(config.model_type, "k2_aurora")
+        self.assertEqual(config.architectures, ["K2AuroraForCausalLM"])
+        self.assertEqual(config.hidden_size, 4096)
+        self.assertEqual(config.xllm_source_router_gemm_partitions, 2)
+
+    def test_invalid_remote_config_fallback_rejects_other_architectures(self):
+        remote_error = hf_transformers_utils.StrictDataclassDefinitionError(
+            "unrelated invalid remote config"
+        )
+        raw_config = {
+            "architectures": ["UnrelatedForCausalLM"],
+            "model_type": "unrelated",
+        }
+        with (
+            patch.object(
+                hf_transformers_utils.AutoConfig,
+                "from_pretrained",
+                side_effect=remote_error,
+            ),
+            patch.object(
+                hf_transformers_utils.PretrainedConfig,
+                "get_config_dict",
+                return_value=(raw_config, {}),
+            ),
+            self.assertRaises(hf_transformers_utils.StrictDataclassDefinitionError),
+        ):
+            hf_transformers_utils.get_config(
+                "unrelated-invalid-strict-config-unit-test",
+                trust_remote_code=True,
+            )
+
     def test_permute_helpers_are_inverse(self):
         x = torch.arange(2 * 3 * 8, dtype=torch.float32).reshape(2, 3, 8)
 
@@ -102,15 +163,15 @@ class TestXllmModel(unittest.TestCase):
 
         torch.testing.assert_close(logits, hidden_states @ gate.weight.T)
         self.assertEqual(gate.bias.dtype, torch.float32)
-        self.assertFalse(torch.allclose(logits, hidden_states @ gate.weight.T + gate.bias))
+        self.assertFalse(
+            torch.allclose(logits, hidden_states @ gate.weight.T + gate.bias)
+        )
 
     def test_entry_class_and_expert_location_metadata(self):
-        self.assertIs(EntryClass, XllmForCausalLM)
+        self.assertEqual(EntryClass, [XllmForCausalLM, K2AuroraForCausalLM])
 
         config = SimpleNamespace(num_hidden_layers=61, num_experts=192)
-        expert_location = XllmForCausalLM.get_model_config_for_expert_location(
-            config
-        )
+        expert_location = XllmForCausalLM.get_model_config_for_expert_location(config)
         self.assertEqual(expert_location.num_layers, 61)
         self.assertEqual(expert_location.num_logical_experts, 192)
         self.assertIsNone(expert_location.num_groups)

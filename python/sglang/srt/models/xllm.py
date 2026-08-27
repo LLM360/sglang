@@ -112,20 +112,6 @@ class XllmGroupRMSNorm(nn.Module):
         return hidden_states
 
 
-def _make_norm(config):
-    """Create the appropriate RMSNorm for this config."""
-    n_groups = getattr(config, "layernorm_num_groups", 1)
-    is_mova = getattr(config, "num_values", 0) > 0
-    if (n_groups is None or n_groups <= 1) and not is_mova:
-        return RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-    return XllmGroupRMSNorm(
-        config.hidden_size,
-        n_groups=n_groups or 1,
-        eps=config.rms_norm_eps,
-        zero_centered=is_mova,
-    )
-
-
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -196,6 +182,220 @@ _is_cpu_amx_available = cpu_has_amx_support()
 
 _XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY = "xllm_source_router_gemm_partitions"
 _XLLM_SOURCE_ROUTER_PARTITIONS_MISSING = object()
+_XLLM_CHECKPOINT_FORMAT_CONFIG_KEY = "_sglang_xllm_checkpoint_format"
+_K2_AURORA_HF_CHECKPOINT_FORMAT = "k2_aurora_hf"
+_CONFIG_ATTR_MISSING = object()
+
+
+def _is_k2_aurora_hf_checkpoint(config: PretrainedConfig) -> bool:
+    return (
+        getattr(config, _XLLM_CHECKPOINT_FORMAT_CONFIG_KEY, None)
+        == _K2_AURORA_HF_CHECKPOINT_FORMAT
+    )
+
+
+def _set_k2_aurora_alias(
+    config: PretrainedConfig,
+    *,
+    source_name: str,
+    target_name: str,
+    value: Any,
+) -> None:
+    """Set one explicit K2Aurora schema alias, rejecting contradictions."""
+
+    current = getattr(config, target_name, _CONFIG_ATTR_MISSING)
+    if current is not _CONFIG_ATTR_MISSING and current is not None:
+        if current != value:
+            raise ValueError(
+                f"K2Aurora config has conflicting {source_name}={value!r} "
+                f"and {target_name}={current!r}"
+            )
+        return
+    setattr(config, target_name, value)
+
+
+def _normalize_k2_aurora_config(config: PretrainedConfig) -> None:
+    """Translate the canonical K2Aurora HF schema to the native xLLM path.
+
+    This adapter intentionally maps only fields that K2Aurora spells
+    differently. In particular, source router GEMM topology is provenance,
+    not an architecture property, so it must be supplied explicitly.
+    """
+
+    mova_num_experts = getattr(config, "mova_num_experts", _CONFIG_ATTR_MISSING)
+    if (
+        isinstance(mova_num_experts, bool)
+        or not isinstance(mova_num_experts, int)
+        or mova_num_experts <= 0
+    ):
+        raise ValueError(
+            "The native K2Aurora adapter currently supports canonical MoVA "
+            "checkpoints only; mova_num_experts must be a positive integer, "
+            f"got {mova_num_experts!r}."
+        )
+    if _get_xllm_source_router_gemm_partitions(config) is None:
+        raise ValueError(
+            "K2Aurora MoVA requires explicit source router GEMM provenance; "
+            "SGLang will not infer it from runtime tensor parallelism. After "
+            "confirming the training contract, pass "
+            "--json-model-override-args "
+            "'{\"xllm_source_router_gemm_partitions\": 2}' (use 1 only for "
+            "a confirmed MP1 source checkpoint)."
+        )
+
+    _set_k2_aurora_alias(
+        config,
+        source_name="mova_num_experts",
+        target_name="num_values",
+        value=mova_num_experts,
+    )
+    mova_num_experts_per_tok = getattr(
+        config, "mova_num_experts_per_tok", _CONFIG_ATTR_MISSING
+    )
+    if (
+        isinstance(mova_num_experts_per_tok, bool)
+        or not isinstance(mova_num_experts_per_tok, int)
+        or not 0 < mova_num_experts_per_tok <= mova_num_experts
+    ):
+        raise ValueError(
+            "K2Aurora mova_num_experts_per_tok must be a positive integer no "
+            f"larger than mova_num_experts, got {mova_num_experts_per_tok!r}"
+        )
+    _set_k2_aurora_alias(
+        config,
+        source_name="mova_num_experts_per_tok",
+        target_name="num_values_per_tok",
+        value=mova_num_experts_per_tok,
+    )
+
+    attention_gate_func = getattr(config, "attention_gate_func", _CONFIG_ATTR_MISSING)
+    if attention_gate_func is not _CONFIG_ATTR_MISSING:
+        _set_k2_aurora_alias(
+            config,
+            source_name="attention_gate_func",
+            target_name="attn_gate_func",
+            value=attention_gate_func,
+        )
+        _set_k2_aurora_alias(
+            config,
+            source_name="attention_gate_func",
+            target_name="apply_attn_gate",
+            value=attention_gate_func is not None,
+        )
+
+    rope_parameters = getattr(config, "rope_parameters", _CONFIG_ATTR_MISSING)
+    if rope_parameters is not _CONFIG_ATTR_MISSING and rope_parameters is not None:
+        if not isinstance(rope_parameters, dict):
+            raise ValueError(
+                "K2Aurora rope_parameters must be a dictionary, got "
+                f"{type(rope_parameters).__name__}"
+            )
+        rope_type = rope_parameters.get(
+            "rope_type", rope_parameters.get("type", _CONFIG_ATTR_MISSING)
+        )
+        if rope_type != "default":
+            raise ValueError(
+                "K2Aurora direct loading supports only explicit default "
+                f"rope_parameters, got rope_type={rope_type!r}"
+            )
+        if (
+            "rope_type" in rope_parameters
+            and "type" in rope_parameters
+            and rope_parameters["rope_type"] != rope_parameters["type"]
+        ):
+            raise ValueError(
+                "K2Aurora rope_parameters has conflicting rope_type and type"
+            )
+        rope_theta = rope_parameters.get("rope_theta", _CONFIG_ATTR_MISSING)
+        if rope_theta is _CONFIG_ATTR_MISSING:
+            raise ValueError(
+                "K2Aurora default rope_parameters must explicitly provide " "rope_theta"
+            )
+        if (
+            isinstance(rope_theta, bool)
+            or not isinstance(rope_theta, (int, float))
+            or not math.isfinite(rope_theta)
+            or rope_theta <= 0
+        ):
+            raise ValueError(
+                "K2Aurora rope_theta must be a positive finite number, got "
+                f"{rope_theta!r}"
+            )
+        _set_k2_aurora_alias(
+            config,
+            source_name="rope_parameters.rope_theta",
+            target_name="rope_theta",
+            value=rope_theta,
+        )
+        default_rope_scaling = dict(rope_parameters)
+        default_rope_scaling.pop("type", None)
+        default_rope_scaling["rope_type"] = "default"
+        current_rope_scaling = getattr(config, "rope_scaling", _CONFIG_ATTR_MISSING)
+        # Transformers 5 exposes rope_scaling as a property alias for the
+        # original rope_parameters dictionary. That is the same source field,
+        # not a second independently specified value.
+        if current_rope_scaling == rope_parameters:
+            setattr(config, "rope_scaling", default_rope_scaling)
+        else:
+            _set_k2_aurora_alias(
+                config,
+                source_name="rope_parameters",
+                target_name="rope_scaling",
+                value=default_rope_scaling,
+            )
+
+    mlp_only_layers = getattr(config, "mlp_only_layers", _CONFIG_ATTR_MISSING)
+    if mlp_only_layers is not _CONFIG_ATTR_MISSING:
+        if not isinstance(mlp_only_layers, (list, tuple)) or any(
+            isinstance(layer_id, bool) or not isinstance(layer_id, int)
+            for layer_id in mlp_only_layers
+        ):
+            raise ValueError("K2Aurora mlp_only_layers must be a list of integers")
+        expected_prefix = list(range(len(mlp_only_layers)))
+        if list(mlp_only_layers) != expected_prefix:
+            raise ValueError(
+                "K2Aurora MoVA requires mlp_only_layers to be a contiguous "
+                f"prefix starting at zero, got {list(mlp_only_layers)}"
+            )
+        _set_k2_aurora_alias(
+            config,
+            source_name="mlp_only_layers",
+            target_name="num_dense_layers",
+            value=len(mlp_only_layers),
+        )
+
+    current_format = getattr(
+        config, _XLLM_CHECKPOINT_FORMAT_CONFIG_KEY, _CONFIG_ATTR_MISSING
+    )
+    if current_format not in (
+        _CONFIG_ATTR_MISSING,
+        _K2_AURORA_HF_CHECKPOINT_FORMAT,
+    ):
+        raise ValueError(
+            "K2Aurora native adapter requires checkpoint format "
+            f"{_K2_AURORA_HF_CHECKPOINT_FORMAT!r}, got {current_format!r}"
+        )
+    setattr(
+        config,
+        _XLLM_CHECKPOINT_FORMAT_CONFIG_KEY,
+        _K2_AURORA_HF_CHECKPOINT_FORMAT,
+    )
+
+
+def _make_norm(config):
+    """Create the appropriate RMSNorm for this config."""
+    n_groups = getattr(config, "layernorm_num_groups", 1)
+    is_mova = getattr(config, "num_values", 0) > 0
+    if (n_groups is None or n_groups <= 1) and not is_mova:
+        return RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    return XllmGroupRMSNorm(
+        config.hidden_size,
+        n_groups=n_groups or 1,
+        eps=config.rms_norm_eps,
+        # Converted xLLM MoVA stores zero-centered norm deltas. Canonical
+        # K2Aurora HF stores ordinary one-centered RMSNorm weights directly.
+        zero_centered=is_mova and not _is_k2_aurora_hf_checkpoint(config),
+    )
 
 
 def _get_xllm_source_router_gemm_partitions(
@@ -391,13 +591,27 @@ def _xllm_stacked_params_mapping(config: PretrainedConfig):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
-    mapping = [
-        (".qkg_proj", ".q_proj", "q"),
-        (".qkg_proj", ".attn_gate_proj", "gate"),
-        (".qkg_proj", ".k_proj", "k"),
-        (".gate_up_proj", ".gate_proj", 0),
-        (".gate_up_proj", ".up_proj", 1),
-    ]
+    if _is_k2_aurora_hf_checkpoint(config):
+        # Canonical K2Aurora calls the attention gate ``gate_proj`` too. Keep
+        # the self-attention scope in both sides of these patterns so it does
+        # not collide with the MLP gate projection below.
+        mapping = [
+            (".self_attn.qkg_proj", ".self_attn.q_proj", "q"),
+            (".self_attn.qkg_proj", ".self_attn.gate_proj", "gate"),
+            (".self_attn.qkg_proj", ".self_attn.k_proj", "k"),
+        ]
+    else:
+        mapping = [
+            (".qkg_proj", ".q_proj", "q"),
+            (".qkg_proj", ".attn_gate_proj", "gate"),
+            (".qkg_proj", ".k_proj", "k"),
+        ]
+    mapping.extend(
+        [
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+    )
     mapping.extend(
         (".v_experts.weight", f".v_experts.{expert_id}.weight", expert_id)
         for expert_id in range(config.num_values)
@@ -620,8 +834,8 @@ class XllmMoEGate(nn.Module):
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
-        self.source_router_gemm_partitions = (
-            _get_xllm_source_router_gemm_partitions(config)
+        self.source_router_gemm_partitions = _get_xllm_source_router_gemm_partitions(
+            config
         )
         self.weight = nn.Parameter(
             torch.empty((config.num_experts, config.hidden_size))
@@ -1115,8 +1329,8 @@ class XllmMoVAAttention(_XllmMoVAAttentionBase):
         self.router_score_func = getattr(config, "router_score_func", "sigmoid")
         self.router_scaling_factor = getattr(config, "router_scaling_factor", 1.0)
         self.renormalize = getattr(config, "norm_topk_prob", True)
-        self.source_router_gemm_partitions = (
-            _get_xllm_source_router_gemm_partitions(config)
+        self.source_router_gemm_partitions = _get_xllm_source_router_gemm_partitions(
+            config
         )
         self.v_router = ReplicatedLinear(
             config.hidden_size,
@@ -1548,6 +1762,7 @@ class XllmForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            checkpoint_name = name
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -1571,6 +1786,15 @@ class XllmForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
+                    if (
+                        _is_k2_aurora_hf_checkpoint(self.config)
+                        and weight_name == ".self_attn.gate_proj"
+                    ):
+                        raise RuntimeError(
+                            "K2Aurora attention gate did not resolve to a model "
+                            f"parameter: checkpoint={checkpoint_name!r}, "
+                            f"mapped={name!r}"
+                        )
                     continue
 
                 param = params_dict[name]
@@ -1616,4 +1840,17 @@ class XllmForCausalLM(nn.Module):
         )
 
 
-EntryClass = XllmForCausalLM
+class K2AuroraForCausalLM(XllmForCausalLM):
+    """Load canonical K2Aurora HF checkpoints through the native xLLM path."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        _normalize_k2_aurora_config(config)
+        super().__init__(config, quant_config=quant_config, prefix=prefix)
+
+
+EntryClass = [XllmForCausalLM, K2AuroraForCausalLM]
