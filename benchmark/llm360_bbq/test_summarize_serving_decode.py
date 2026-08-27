@@ -77,6 +77,7 @@ class ServingValidationTests(unittest.TestCase):
                 "mova.py",
                 "weight_utils.py",
                 "hf_transformers_utils.py",
+                "checkpoint_layout.py",
             )
             for index, name in enumerate(snapshot_files):
                 (snapshot / name).write_text(f"snapshot-{index}\n", encoding="utf-8")
@@ -131,7 +132,7 @@ class ServingValidationTests(unittest.TestCase):
 
             result = json.loads(output.read_text(encoding="utf-8"))
             hashes = result["provenance"]["source_sha256"]
-            self.assertEqual(len(hashes), 7)
+            self.assertEqual(len(hashes), 8)
             for name in snapshot_files:
                 path = str((snapshot / name).resolve())
                 self.assertEqual(hashes[path], summary.sha256_file(snapshot / name))

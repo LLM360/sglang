@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from checkpoint_layout import CheckpointLayout, resolve_checkpoint_layout
+
 import torch
 from transformers import AutoConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
@@ -74,7 +77,9 @@ def _parse_sglang_rows(
     return parsed
 
 
-def _restore_router_biases(model: Any) -> list[dict[str, Any]]:
+def _restore_router_biases(
+    model: Any, checkpoint_layout: CheckpointLayout
+) -> list[dict[str, Any]]:
     """Restore selection-only router biases at checkpoint precision.
 
     The model is otherwise loaded in BF16, but SGLang's fused top-k keeps the
@@ -83,13 +88,18 @@ def _restore_router_biases(model: Any) -> list[dict[str, Any]]:
     empty list.
     """
 
-    index_path = MODEL_PATH / "pytorch_model.bin.index.json"
+    index_path = checkpoint_layout.index_path
     weight_map = json.loads(index_path.read_text())["weight_map"]
     bias_names = sorted(
         name
         for name in weight_map
         if name.endswith(("self_attn.v_router.bias", "mlp.gate.bias"))
     )
+    if bias_names and checkpoint_layout.format != "pytorch_bin":
+        raise ValueError(
+            "FP32 router-bias restoration is supported only for PyTorch .bin "
+            f"checkpoints, got {checkpoint_layout.format}"
+        )
     names_by_shard: dict[str, list[str]] = {}
     for name in bias_names:
         names_by_shard.setdefault(weight_map[name], []).append(name)
@@ -97,7 +107,7 @@ def _restore_router_biases(model: Any) -> list[dict[str, Any]]:
     restored = []
     for shard_name, names in sorted(names_by_shard.items()):
         state = torch.load(
-            MODEL_PATH / shard_name,
+            checkpoint_layout.model_path / shard_name,
             map_location="cpu",
             weights_only=True,
             mmap=True,
@@ -242,6 +252,134 @@ def _xllm_375b_partial_rope_parameters(
     return _unscaled_rope_parameters(config, device, dim=int(config.rope_head_dim))
 
 
+_K2_AURORA_DENSE_1B_RAW_EXPECTED = {
+    "architectures": ["K2AuroraForCausalLM"],
+    "model_type": "k2_aurora",
+    "hidden_size": 1536,
+    "intermediate_size": 5120,
+    "head_dim": 64,
+    "rope_head_dim": 64,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "num_hidden_layers": 28,
+    "num_experts": 0,
+    "num_experts_per_tok": 0,
+    "num_shared_experts": 0,
+    "moe_intermediate_size": 0,
+    "mlp_only_layers": list(range(28)),
+    "max_position_embeddings": 131072,
+    "original_max_position_embeddings": 8192,
+    "vocab_size": 64256,
+    "rope_theta": 1000000.0,
+    "rope_parameters": {
+        "attention_factor": 1.2772588722239782,
+        "beta_fast": 128.0,
+        "beta_slow": 4.0,
+        "factor": 16.0,
+        "original_max_position_embeddings": 8192,
+        "rope_type": "yarn",
+        "truncate": True,
+    },
+}
+
+
+def _is_k2_aurora_dense_1b_candidate(raw_config: dict[str, Any]) -> bool:
+    return bool(
+        raw_config.get("model_type") == "k2_aurora"
+        and raw_config.get("architectures") == ["K2AuroraForCausalLM"]
+        and raw_config.get("num_experts") == 0
+        and raw_config.get("hidden_size") == 1536
+        and raw_config.get("num_hidden_layers") == 28
+        and raw_config.get("mova_num_experts", 0) == 0
+    )
+
+
+def _k2_aurora_dense_1b_raw_mismatches(
+    raw_config: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    return {
+        key: {"expected": expected, "actual": raw_config.get(key)}
+        for key, expected in _K2_AURORA_DENSE_1B_RAW_EXPECTED.items()
+        if raw_config.get(key) != expected
+    }
+
+
+def _normalize_k2_aurora_dense_1b_rope_config(
+    config: Any, raw_config: dict[str, Any]
+) -> bool:
+    """Restore the pinned dense-1B topology/YaRN contract after TF5 normalization.
+
+    The artifact stores ``rope_theta`` at top level and a separate YaRN
+    ``rope_parameters`` dictionary. The pinned Transformers-5 config path first
+    standardizes the former into the latter, then overwrites the standardized
+    dictionary with the raw one, dropping the base that both the registered
+    YaRN initializer and artifact-local rotary implementation require.
+    """
+
+    if not _is_k2_aurora_dense_1b_candidate(raw_config):
+        return False
+
+    raw_mismatches = _k2_aurora_dense_1b_raw_mismatches(raw_config)
+    if raw_mismatches:
+        raise ValueError(
+            "The K2Aurora dense-1B RoPE compatibility shim only supports the "
+            "exact pinned dense-1B topology/YaRN contract; "
+            f"mismatches={raw_mismatches!r}"
+        )
+
+    rope_parameters = getattr(config, "rope_parameters", None)
+    expected_raw_rope = _K2_AURORA_DENSE_1B_RAW_EXPECTED["rope_parameters"]
+    if type(rope_parameters) is not dict:
+        raise ValueError(
+            "The exact K2Aurora dense-1B config must expose rope_parameters as "
+            f"a dict, got {type(rope_parameters).__name__}"
+        )
+    rope_without_theta = {
+        key: value for key, value in rope_parameters.items() if key != "rope_theta"
+    }
+    if rope_without_theta != expected_raw_rope:
+        raise ValueError(
+            "The exact K2Aurora dense-1B config has unexpected normalized YaRN "
+            f"parameters: expected={expected_raw_rope!r}, actual={rope_without_theta!r}"
+        )
+
+    expected_theta = _K2_AURORA_DENSE_1B_RAW_EXPECTED["rope_theta"]
+    injected_nested_theta = "rope_theta" not in rope_parameters
+    if not injected_nested_theta and rope_parameters["rope_theta"] != expected_theta:
+        raise ValueError(
+            "The exact K2Aurora dense-1B config has a conflicting nested "
+            f"rope_theta: expected={expected_theta!r}, "
+            f"actual={rope_parameters['rope_theta']!r}"
+        )
+
+    missing = object()
+    top_level_theta = getattr(config, "rope_theta", missing)
+    injected_top_level_theta = top_level_theta is missing
+    if not injected_top_level_theta and top_level_theta != expected_theta:
+        raise ValueError(
+            "The exact K2Aurora dense-1B config has a conflicting top-level "
+            f"rope_theta: expected={expected_theta!r}, actual={top_level_theta!r}"
+        )
+
+    config.rope_parameters = {**rope_parameters, "rope_theta": expected_theta}
+    config.rope_theta = expected_theta
+    expected_config = {
+        **_K2_AURORA_DENSE_1B_RAW_EXPECTED,
+        "rope_parameters": {**expected_raw_rope, "rope_theta": expected_theta},
+    }
+    config_mismatches = {
+        key: {"expected": expected, "actual": getattr(config, key, None)}
+        for key, expected in expected_config.items()
+        if getattr(config, key, None) != expected
+    }
+    if config_mismatches:
+        raise ValueError(
+            "The exact K2Aurora dense-1B config failed post-normalization "
+            f"validation; mismatches={config_mismatches!r}"
+        )
+    return injected_nested_theta or injected_top_level_theta
+
+
 def _install_default_rope_alias() -> bool:
     """Restore the Transformers-4 unscaled RoPE registry key.
 
@@ -312,16 +450,26 @@ def _install_output_recorder_compat() -> bool:
             raise
 
     module = types.ModuleType(module_name)
+    generic_module = importlib.import_module("transformers.utils.generic")
+    generic_output_recorder = getattr(generic_module, "OutputRecorder", None)
+    if generic_output_recorder is not None:
+        if not isinstance(generic_output_recorder, type):
+            raise TypeError(
+                "transformers.utils.generic.OutputRecorder must be a class, got "
+                f"{type(generic_output_recorder).__name__}"
+            )
+        module.OutputRecorder = generic_output_recorder
+    else:
 
-    @dataclass
-    class OutputRecorder:
-        target_class: type
-        index: int = 0
-        layer_name: str | None = None
-        class_name: str | None = None
-        capture_initial_hidden_state: bool = True
+        @dataclass
+        class OutputRecorder:
+            target_class: type
+            index: int = 0
+            layer_name: str | None = None
+            class_name: str | None = None
+            capture_initial_hidden_state: bool = True
 
-    module.OutputRecorder = OutputRecorder
+        module.OutputRecorder = OutputRecorder
     sys.modules[module_name] = module
     return True
 
@@ -547,10 +695,15 @@ def main() -> None:
             "SGLang probe is incomplete; HF parity requires exactly 16 prompts "
             "and 16 results in both deterministic passes"
         )
+    checkpoint_layout = resolve_checkpoint_layout(MODEL_PATH)
+    raw_checkpoint_config = json.loads((MODEL_PATH / "config.json").read_text())
     config = AutoConfig.from_pretrained(
         MODEL_PATH,
         trust_remote_code=True,
         local_files_only=True,
+    )
+    normalized_k2_aurora_dense_1b_rope = _normalize_k2_aurora_dense_1b_rope_config(
+        config, raw_checkpoint_config
     )
     config._attn_implementation = "eager"
     model_class = get_class_from_dynamic_module(
@@ -609,9 +762,11 @@ def main() -> None:
             installed_output_recorder_compat
         ),
         "installed_transformers4_default_rope_alias": installed_default_rope_alias,
+        "normalized_k2_aurora_dense_1b_rope": (normalized_k2_aurora_dense_1b_rope),
         "patched_remote_mask_functions": patched_mask_functions,
         "patched_remote_rotary_classes": patched_rotary_classes,
         "patched_xllm_375b_partial_rope_classes": (patched_xllm_partial_rope_classes),
+        "checkpoint_layout": checkpoint_layout.as_dict(),
         "prompts": [],
     }
     _write(record)
@@ -643,7 +798,7 @@ def main() -> None:
         config=config,
         trust_remote_code=True,
         local_files_only=True,
-        use_safetensors=False,
+        use_safetensors=checkpoint_layout.use_safetensors,
         dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         device_map=device_map,
@@ -655,7 +810,11 @@ def main() -> None:
         str(key): str(value)
         for key, value in getattr(model, "hf_device_map", {}).items()
     }
-    router_biases = _restore_router_biases(model) if PRESERVE_ROUTER_BIASES_FP32 else []
+    router_biases = (
+        _restore_router_biases(model, checkpoint_layout)
+        if PRESERVE_ROUTER_BIASES_FP32
+        else []
+    )
     record["router_bias_contract"] = {
         "preserve_fp32": PRESERVE_ROUTER_BIASES_FP32,
         "reason": "SGLang fused top-k keeps selection-only correction biases in FP32",

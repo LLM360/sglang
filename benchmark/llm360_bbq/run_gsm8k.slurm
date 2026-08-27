@@ -22,6 +22,7 @@ readonly PROJECT_ROOT=/mnt/weka/home/yash.akhauri/projects/3sept_bbq_sglang
 readonly REPO_ROOT=${PROJECT_ROOT}/sglang
 readonly IMAGE=/mnt/weka/shrd/k2pta/agentic_rl_images/agentic-rl-437516ff.sqsh
 readonly EVALUATOR=${REPO_ROOT}/benchmark/llm360_bbq/gsm8k_sglang.py
+readonly CHECKPOINT_LAYOUT=${REPO_ROOT}/benchmark/llm360_bbq/checkpoint_layout.py
 readonly GSM8K_SOURCE=${BBQ_GSM8K_SOURCE:-/mnt/weka/shrd/k2m/lingjie.chen/eval/junlin_merged_7b_linear_b1_fullsuite_20260821/gsm8k/generations.jsonl}
 readonly GSM8K_SOURCE_DIR=${GSM8K_SOURCE%/*}
 readonly EXPECTED_GSM8K_SHA256=${BBQ_GSM8K_EXPECTED_SHA256:-785c055981d4313d64120282c69a1259db8057817a1708cbb5842ab072aa2af4}
@@ -47,7 +48,6 @@ else
 fi
 
 test -f "${BBQ_MODEL_PATH}/config.json"
-test -f "${BBQ_MODEL_PATH}/pytorch_model.bin.index.json"
 test -f "${BBQ_MODEL_PATH}/tokenizer.json"
 test -f "${GSM8K_SOURCE}"
 test "$(sha256sum "${GSM8K_SOURCE}" | awk '{print $1}')" = "${EXPECTED_GSM8K_SHA256}"
@@ -55,6 +55,12 @@ test "$(sha256sum "${GSM8K_SOURCE}" | awk '{print $1}')" = "${EXPECTED_GSM8K_SHA
 mkdir -p "${RESULT_ROOT}"
 cp "$0" "${RESULT_ROOT}/run.slurm"
 cp "${EVALUATOR}" "${RESULT_ROOT}/gsm8k_sglang.py"
+cp "${CHECKPOINT_LAYOUT}" "${RESULT_ROOT}/checkpoint_layout.py"
+sha256sum -- "${RESULT_ROOT}/checkpoint_layout.py" \
+  > "${RESULT_ROOT}/checkpoint-layout-source-sha256.txt"
+python3 "${RESULT_ROOT}/checkpoint_layout.py" \
+  --model-path "${BBQ_MODEL_PATH}" \
+  > "${RESULT_ROOT}/checkpoint-layout.json"
 git -C "${REPO_ROOT}" rev-parse HEAD > "${RESULT_ROOT}/sglang-commit.txt"
 git -C "${REPO_ROOT}" status --short --branch > "${RESULT_ROOT}/sglang-status.txt"
 

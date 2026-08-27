@@ -22,13 +22,20 @@ readonly PROJECT_ROOT=/mnt/weka/home/yash.akhauri/projects/3sept_bbq_sglang
 readonly REPO_ROOT=${PROJECT_ROOT}/sglang
 readonly IMAGE=/mnt/weka/shrd/k2pta/agentic_rl_images/agentic-rl-437516ff.sqsh
 readonly PROBE=${REPO_ROOT}/benchmark/llm360_bbq/probe_sglang.py
+readonly CHECKPOINT_LAYOUT=${REPO_ROOT}/benchmark/llm360_bbq/checkpoint_layout.py
 readonly RESULT_ROOT=${PROJECT_ROOT}/artifacts/models/${BBQ_MODEL_NAME}/job-${SLURM_JOB_ID}
 
 test -f "${BBQ_MODEL_PATH}/config.json"
-test -f "${BBQ_MODEL_PATH}/pytorch_model.bin.index.json"
+test -f "${BBQ_MODEL_PATH}/tokenizer.json"
 mkdir -p "${RESULT_ROOT}"
 cp "$0" "${RESULT_ROOT}/run.slurm"
 cp "${PROBE}" "${RESULT_ROOT}/probe.py"
+cp "${CHECKPOINT_LAYOUT}" "${RESULT_ROOT}/checkpoint_layout.py"
+sha256sum -- "${RESULT_ROOT}/checkpoint_layout.py" \
+  > "${RESULT_ROOT}/checkpoint-layout-source-sha256.txt"
+python3 "${RESULT_ROOT}/checkpoint_layout.py" \
+  --model-path "${BBQ_MODEL_PATH}" \
+  > "${RESULT_ROOT}/checkpoint-layout.json"
 git -C "${REPO_ROOT}" rev-parse HEAD > "${RESULT_ROOT}/sglang-commit.txt"
 git -C "${REPO_ROOT}" status --short --branch > "${RESULT_ROOT}/sglang-status.txt"
 

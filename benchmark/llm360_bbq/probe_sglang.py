@@ -149,13 +149,23 @@ def _sampling(max_new_tokens: int) -> dict[str, Any]:
     }
 
 
-def _make_exact_length(seed_ids: list[int], length: int, variant: int = 0) -> list[int]:
+def _make_exact_length(
+    seed_ids: list[int], length: int, vocab_size: int, variant: int = 0
+) -> list[int]:
     if length < 2:
         raise ValueError(f"Synthetic input length must be >= 2, got {length}")
+    if vocab_size <= 0:
+        raise ValueError(f"Vocabulary size must be positive, got {vocab_size}")
     if not seed_ids:
         raise ValueError("Cannot construct a synthetic input from an empty token list")
+    invalid_ids = [token for token in seed_ids if token < 0 or token >= vocab_size]
+    if invalid_ids:
+        raise ValueError(
+            "Synthetic input seed contains token IDs outside the configured "
+            f"vocabulary [0, {vocab_size}): {invalid_ids[:8]}"
+        )
     values = (seed_ids * ((length + len(seed_ids) - 1) // len(seed_ids)))[:length]
-    values[-1] = int((values[-1] + variant) % 250000)
+    values[-1] = int((values[-1] + variant) % vocab_size)
     return values
 
 
@@ -188,6 +198,15 @@ def main() -> None:
             f"Requested {LONG_INPUT_LEN}+8 tokens exceeds configured context "
             f"{config.max_position_embeddings}"
         )
+    vocab_size = getattr(config, "vocab_size", None)
+    if (
+        not isinstance(vocab_size, int)
+        or isinstance(vocab_size, bool)
+        or vocab_size <= 0
+    ):
+        raise ValueError(
+            f"Configured vocabulary size must be a positive integer, got {vocab_size!r}"
+        )
 
     record: dict[str, Any] = {
         "status": "loading",
@@ -202,6 +221,7 @@ def main() -> None:
             "hidden_size": int(config.hidden_size),
             "attention_heads": int(config.num_attention_heads),
             "kv_heads": int(config.num_key_value_heads),
+            "vocab_size": vocab_size,
             "max_position_embeddings": int(config.max_position_embeddings),
             "eos_token_id": getattr(config, "eos_token_id", None),
         },
@@ -319,7 +339,7 @@ def main() -> None:
         _write(record)
 
         seed_ids = prompt_ids[0]
-        long_ids = _make_exact_length(seed_ids, LONG_INPUT_LEN)
+        long_ids = _make_exact_length(seed_ids, LONG_INPUT_LEN, vocab_size)
         started = time.perf_counter()
         long_result = _normalize_results(
             engine.generate(
@@ -342,10 +362,12 @@ def main() -> None:
         _write(record)
 
         benchmark_rows = []
-        bench_seed = _make_exact_length(seed_ids, BENCH_INPUT_LEN)
+        bench_seed = _make_exact_length(seed_ids, BENCH_INPUT_LEN, vocab_size)
         for batch_size in BENCH_BATCH_SIZES:
             inputs = [
-                _make_exact_length(bench_seed, BENCH_INPUT_LEN, variant=index)
+                _make_exact_length(
+                    bench_seed, BENCH_INPUT_LEN, vocab_size, variant=index
+                )
                 for index in range(batch_size)
             ]
             started = time.perf_counter()

@@ -20,6 +20,9 @@ import traceback
 from pathlib import Path
 from typing import Any, Iterable
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from checkpoint_layout import CheckpointLayout, resolve_checkpoint_layout
+
 DEFAULT_DATA_PATH = Path(
     "/mnt/weka/shrd/k2m/lingjie.chen/eval/"
     "junlin_merged_7b_linear_b1_fullsuite_20260821/"
@@ -565,16 +568,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def validate_args(args: argparse.Namespace) -> None:
+def validate_args(args: argparse.Namespace) -> CheckpointLayout:
     args.model_path = args.model_path.resolve()
     args.output_dir = args.output_dir.resolve()
     args.data_path = args.data_path.resolve()
     args.sglang_source_root = args.sglang_source_root.resolve()
     if not args.model_path.is_dir():
         raise ValueError(f"Model path is not a directory: {args.model_path}")
-    for filename in ("config.json", "pytorch_model.bin.index.json", "tokenizer.json"):
+    for filename in ("config.json", "tokenizer.json"):
         if not (args.model_path / filename).is_file():
             raise ValueError(f"Required checkpoint file is missing: {filename}")
+    checkpoint_layout = resolve_checkpoint_layout(args.model_path)
     if not args.data_path.is_file():
         raise ValueError(f"GSM8K source does not exist: {args.data_path}")
     if not 1 <= args.limit <= EXPECTED_SOURCE_ROWS:
@@ -595,11 +599,12 @@ def validate_args(args: argparse.Namespace) -> None:
     loader_config = json.loads(args.model_loader_extra_config_json)
     if not isinstance(loader_config, dict):
         raise ValueError("--model-loader-extra-config-json must decode to an object")
+    return checkpoint_layout
 
 
 def main() -> None:
     args = parse_args()
-    validate_args(args)
+    checkpoint_layout = validate_args(args)
 
     # Heavy imports stay out of module scope so prompt/scoring tests are CPU-only.
     import torch
@@ -667,7 +672,7 @@ def main() -> None:
 
     checkpoint_hash_files = (
         "config.json",
-        "pytorch_model.bin.index.json",
+        checkpoint_layout.index_path.name,
         "tokenizer.json",
         "tokenizer_config.json",
     )
@@ -677,7 +682,10 @@ def main() -> None:
         if (args.model_path / filename).is_file()
     }
     source_hashes = {
-        str(Path(__file__).resolve()): sha256_file(Path(__file__).resolve())
+        str(Path(__file__).resolve()): sha256_file(Path(__file__).resolve()),
+        str(Path(__file__).with_name("checkpoint_layout.py").resolve()): sha256_file(
+            Path(__file__).with_name("checkpoint_layout.py").resolve()
+        ),
     }
     for source_file in source_files:
         source_hashes[str(source_file)] = sha256_file(source_file)
@@ -695,6 +703,7 @@ def main() -> None:
             "serving_dtype": "bfloat16",
             "max_position_embeddings": max_context,
             "checkpoint_metadata_sha256": checkpoint_hashes,
+            "checkpoint_layout": checkpoint_layout.as_dict(),
         },
         "dataset": {
             "path": str(args.data_path),

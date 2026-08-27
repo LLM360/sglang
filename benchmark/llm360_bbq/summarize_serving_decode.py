@@ -261,6 +261,7 @@ def main() -> None:
         args.source_snapshot_root / "mova.py",
         args.source_snapshot_root / "weight_utils.py",
         args.source_snapshot_root / "hf_transformers_utils.py",
+        args.source_snapshot_root / "checkpoint_layout.py",
         Path(__file__).resolve(),
         args.output.parent / "run-worker.sh",
         args.output.parent / "run.slurm",

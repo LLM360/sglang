@@ -23,6 +23,7 @@ readonly REPO_ROOT=${PROJECT_ROOT}/sglang
 readonly IMAGE=/mnt/weka/shrd/k2pta/agentic_rl_images/agentic-rl-437516ff.sqsh
 readonly WORKER=${REPO_ROOT}/benchmark/llm360_bbq/run_serving_decode_worker.sh
 readonly SUMMARIZER=${REPO_ROOT}/benchmark/llm360_bbq/summarize_serving_decode.py
+readonly CHECKPOINT_LAYOUT=${REPO_ROOT}/benchmark/llm360_bbq/checkpoint_layout.py
 
 if [[ ! ${BBQ_MODEL_NAME} =~ ^[A-Za-z0-9._-]+$ ]]; then
   printf 'BBQ_MODEL_NAME may contain only letters, digits, dot, underscore, and hyphen\n' >&2
@@ -116,6 +117,12 @@ mkdir -p "${RESULT_ROOT}"
 cp -- "$0" "${RESULT_ROOT}/run.slurm"
 cp -- "${WORKER}" "${RESULT_ROOT}/run-worker.sh"
 cp -- "${SUMMARIZER}" "${RESULT_ROOT}/summarize.py"
+cp -- "${CHECKPOINT_LAYOUT}" "${RESULT_ROOT}/checkpoint_layout.py"
+sha256sum -- "${RESULT_ROOT}/checkpoint_layout.py" \
+  > "${RESULT_ROOT}/checkpoint-layout-source-sha256.txt"
+python3 "${RESULT_ROOT}/checkpoint_layout.py" \
+  --model-path "${MODEL_PATH}" \
+  > "${RESULT_ROOT}/checkpoint-layout.json"
 git -C "${REPO_ROOT}" rev-parse HEAD > "${RESULT_ROOT}/sglang-commit.txt"
 git -C "${REPO_ROOT}" status --short --branch > "${RESULT_ROOT}/sglang-status.txt"
 
@@ -125,6 +132,7 @@ readonly -a CORE_SOURCE_RELATIVE=(
   python/sglang/srt/layers/mova.py
   python/sglang/srt/model_loader/weight_utils.py
   python/sglang/srt/utils/hf_transformers_utils.py
+  benchmark/llm360_bbq/checkpoint_layout.py
 )
 mkdir -p "${SOURCE_SNAPSHOT}"
 for source_relative in "${CORE_SOURCE_RELATIVE[@]}"; do

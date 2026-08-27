@@ -21,6 +21,17 @@ SPEC.loader.exec_module(probe)
 
 
 class ResultShapeContractTests(unittest.TestCase):
+    def test_exact_length_inputs_stay_inside_small_configured_vocabulary(self) -> None:
+        values = probe._make_exact_length([2, 6], length=5, vocab_size=7, variant=3)
+        self.assertEqual(values, [2, 6, 2, 6, 5])
+        self.assertTrue(all(0 <= token < 7 for token in values))
+
+    def test_exact_length_inputs_reject_invalid_vocabulary_contract(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Vocabulary size must be positive"):
+            probe._make_exact_length([1], length=2, vocab_size=0)
+        with self.assertRaisesRegex(ValueError, "outside the configured vocabulary"):
+            probe._make_exact_length([7], length=2, vocab_size=7)
+
     def test_local_sglang_source_contract_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

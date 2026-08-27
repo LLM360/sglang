@@ -58,6 +58,7 @@ PY
       test/srt/cpu/test_topk.py::TestTopK::test_native_biased_sigmoid_routes_in_fp32 \
       test/registered/unit/model_loader/test_weight_utils.py \
       test/registered/unit/layers/test_mova.py \
+      benchmark/llm360_bbq/test_checkpoint_layout.py \
       benchmark/llm360_bbq/test_gsm8k_sglang.py \
       benchmark/llm360_bbq/test_probe_sglang.py \
       benchmark/llm360_bbq/test_reference_hf.py \
