@@ -875,23 +875,46 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 pbar.update(1)
 
 
+def _is_mmap_unsupported_error(error: RuntimeError) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "mmap can only be used with files saved with",
+            "mmap is not supported",
+            "cannot use mmap",
+        )
+    )
+
+
 def _load_pt_file(bin_file: str) -> dict:
-    """Load a PyTorch checkpoint file, handling legacy tar format.
+    """Load a PyTorch checkpoint file using mmap when possible.
 
     PyTorch 2.6 changed the default of weights_only from False to True.
-    Legacy tar format files cannot be loaded with weights_only=True.
-    This function tries weights_only=True first, then falls back to False
-    for legacy tar format files from trusted sources (HuggingFace Hub).
+    Modern zip-format checkpoints support mmap, which avoids allocating an
+    entire shard in each tensor-parallel process before its tensors are copied
+    into the model. Legacy serialization does not support mmap, and legacy tar
+    files additionally cannot be loaded with weights_only=True. Fall back only
+    for those known format limitations; other load errors must remain visible.
+    As before, the weights_only=False legacy fallback assumes a trusted source.
     """
     try:
-        return torch.load(bin_file, map_location="cpu", weights_only=True)
+        return torch.load(bin_file, map_location="cpu", weights_only=True, mmap=True)
+    except RuntimeError as e:
+        if "legacy .tar format" not in str(e) and not _is_mmap_unsupported_error(e):
+            raise
+
+    try:
+        return torch.load(bin_file, map_location="cpu", weights_only=True, mmap=False)
     except RuntimeError as e:
         if "legacy .tar format" in str(e):
             logger.warning(
                 "Loading %s with weights_only=False (legacy tar format)",
                 os.path.basename(bin_file),
             )
-            return torch.load(bin_file, map_location="cpu", weights_only=False)
+            return torch.load(
+                bin_file, map_location="cpu", weights_only=False, mmap=False
+            )
         raise
 
 
@@ -918,30 +941,69 @@ def multi_thread_pt_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Multi-Thread iterate over the weights in the model bin/pt files."""
+    """Iterate over PyTorch checkpoint shards with bounded prefetching.
+
+    At most ``max_workers`` shard state dictionaries are retained at a time:
+    one being yielded and up to ``max_workers - 1`` loading or ready. Releasing
+    each completed Future before yielding its state is important because a
+    Future otherwise retains its result for its entire lifetime.
+    """
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(_load_pt_file, bin_file) for bin_file in hf_weights_files
-        ]
+        file_iter = iter(hf_weights_files)
+        pending = {
+            executor.submit(_load_pt_file, bin_file)
+            for bin_file in itertools.islice(file_iter, max_workers)
+        }
 
-        if enable_tqdm:
-            futures_iter = tqdm(
-                concurrent.futures.as_completed(futures),
-                total=len(hf_weights_files),
-                desc="Multi-thread loading pt checkpoint shards",
-                disable=not enable_tqdm,
-                bar_format=BAR_FORMAT,
-            )
-        else:
-            futures_iter = concurrent.futures.as_completed(futures)
+        with tqdm(
+            total=len(hf_weights_files),
+            desc="Multi-thread loading pt checkpoint shards",
+            disable=not enable_tqdm,
+            bar_format=BAR_FORMAT,
+        ) as pbar:
+            try:
+                while pending:
+                    done, not_done = concurrent.futures.wait(
+                        pending, return_when=concurrent.futures.FIRST_COMPLETED
+                    )
 
-        for future in futures_iter:
-            state = future.result()
-            yield from state.items()
+                    # wait() may return multiple completed Futures. Surface a
+                    # completed failure before yielding a success or
+                    # replenishing the window, even if pop() would select a
+                    # successful Future first.
+                    for completed_future in done:
+                        if (
+                            completed_future.cancelled()
+                            or completed_future.exception() is not None
+                        ):
+                            pending.remove(completed_future)
+                            try:
+                                completed_future.result()
+                            finally:
+                                # Avoid pinning successful results from the
+                                # same completed batch in the error traceback.
+                                del done, not_done
+
+                    future = done.pop()
+                    pending.remove(future)
+                    del done, not_done
+
+                    state = future.result()
+                    del future
+                    yield from state.items()
+                    del state
+                    pbar.update(1)
+
+                    next_file = next(file_iter, None)
+                    if next_file is not None:
+                        pending.add(executor.submit(_load_pt_file, next_file))
+            finally:
+                while pending:
+                    pending.pop().cancel()
 
 
 def get_gguf_extra_tensor_names(
