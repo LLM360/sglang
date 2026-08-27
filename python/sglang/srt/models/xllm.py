@@ -222,51 +222,107 @@ def _normalize_k2_aurora_config(config: PretrainedConfig) -> None:
     not an architecture property, so it must be supplied explicitly.
     """
 
-    mova_num_experts = getattr(config, "mova_num_experts", _CONFIG_ATTR_MISSING)
-    if (
-        isinstance(mova_num_experts, bool)
-        or not isinstance(mova_num_experts, int)
-        or mova_num_experts <= 0
-    ):
+    # Dense K2Aurora artifacts may omit the MoVA fields entirely, while the
+    # remote config class supplies zero defaults. Treat both representations
+    # identically, but keep malformed/negative values distinct from dense.
+    mova_num_experts = getattr(config, "mova_num_experts", 0)
+    if isinstance(mova_num_experts, bool) or not isinstance(mova_num_experts, int):
         raise ValueError(
-            "The native K2Aurora adapter currently supports canonical MoVA "
-            "checkpoints only; mova_num_experts must be a positive integer, "
+            "K2Aurora mova_num_experts must be a non-negative integer, "
             f"got {mova_num_experts!r}."
         )
-    if _get_xllm_source_router_gemm_partitions(config) is None:
+    if mova_num_experts < 0:
         raise ValueError(
-            "K2Aurora MoVA requires explicit source router GEMM provenance; "
-            "SGLang will not infer it from runtime tensor parallelism. After "
-            "confirming the training contract, pass "
-            "--json-model-override-args "
-            "'{\"xllm_source_router_gemm_partitions\": 2}' (use 1 only for "
-            "a confirmed MP1 source checkpoint)."
+            "K2Aurora mova_num_experts must be a non-negative integer, "
+            f"got {mova_num_experts!r}."
         )
+    is_mova = mova_num_experts > 0
 
-    _set_k2_aurora_alias(
-        config,
-        source_name="mova_num_experts",
-        target_name="num_values",
-        value=mova_num_experts,
-    )
-    mova_num_experts_per_tok = getattr(
-        config, "mova_num_experts_per_tok", _CONFIG_ATTR_MISSING
-    )
-    if (
-        isinstance(mova_num_experts_per_tok, bool)
-        or not isinstance(mova_num_experts_per_tok, int)
-        or not 0 < mova_num_experts_per_tok <= mova_num_experts
-    ):
-        raise ValueError(
-            "K2Aurora mova_num_experts_per_tok must be a positive integer no "
-            f"larger than mova_num_experts, got {mova_num_experts_per_tok!r}"
+    if is_mova:
+        if _get_xllm_source_router_gemm_partitions(config) is None:
+            raise ValueError(
+                "K2Aurora MoVA requires explicit source router GEMM provenance; "
+                "SGLang will not infer it from runtime tensor parallelism. After "
+                "confirming the training contract, pass "
+                "--json-model-override-args "
+                "'{\"xllm_source_router_gemm_partitions\": 2}' (use 1 only for "
+                "a confirmed MP1 source checkpoint)."
+            )
+
+        _set_k2_aurora_alias(
+            config,
+            source_name="mova_num_experts",
+            target_name="num_values",
+            value=mova_num_experts,
         )
-    _set_k2_aurora_alias(
-        config,
-        source_name="mova_num_experts_per_tok",
-        target_name="num_values_per_tok",
-        value=mova_num_experts_per_tok,
-    )
+        mova_num_experts_per_tok = getattr(
+            config, "mova_num_experts_per_tok", _CONFIG_ATTR_MISSING
+        )
+        if (
+            isinstance(mova_num_experts_per_tok, bool)
+            or not isinstance(mova_num_experts_per_tok, int)
+            or not 0 < mova_num_experts_per_tok <= mova_num_experts
+        ):
+            raise ValueError(
+                "K2Aurora mova_num_experts_per_tok must be a positive integer no "
+                f"larger than mova_num_experts, got {mova_num_experts_per_tok!r}"
+            )
+        _set_k2_aurora_alias(
+            config,
+            source_name="mova_num_experts_per_tok",
+            target_name="num_values_per_tok",
+            value=mova_num_experts_per_tok,
+        )
+    else:
+        mova_num_experts_per_tok = getattr(config, "mova_num_experts_per_tok", 0)
+        if (
+            isinstance(mova_num_experts_per_tok, bool)
+            or not isinstance(mova_num_experts_per_tok, int)
+            or mova_num_experts_per_tok != 0
+        ):
+            raise ValueError(
+                "Dense K2Aurora requires mova_num_experts_per_tok=0, got "
+                f"{mova_num_experts_per_tok!r}"
+            )
+        _set_k2_aurora_alias(
+            config,
+            source_name="mova_num_experts",
+            target_name="num_values",
+            value=0,
+        )
+        _set_k2_aurora_alias(
+            config,
+            source_name="mova_num_experts_per_tok",
+            target_name="num_values_per_tok",
+            value=0,
+        )
+        for field in ("num_experts", "num_experts_per_tok", "num_shared_experts"):
+            value = getattr(config, field, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+                raise ValueError(f"Dense K2Aurora requires {field}=0, got {value!r}")
+        if getattr(config, "query_key_norm", False):
+            raise ValueError(
+                "Dense K2Aurora native loading does not support query/key "
+                "normalization"
+            )
+        if getattr(config, "sliding_window", None) is not None or getattr(
+            config, "use_sliding_window", False
+        ):
+            raise ValueError(
+                "Dense K2Aurora native loading supports full causal attention only"
+            )
+        attention_gate_func = getattr(
+            config, "attention_gate_func", _CONFIG_ATTR_MISSING
+        )
+        native_gate_func = getattr(config, "attn_gate_func", _CONFIG_ATTR_MISSING)
+        if (
+            attention_gate_func not in (_CONFIG_ATTR_MISSING, None)
+            or native_gate_func not in (_CONFIG_ATTR_MISSING, None)
+            or getattr(config, "apply_attn_gate", False)
+        ):
+            raise ValueError(
+                "Dense K2Aurora native loading does not support gated attention"
+            )
 
     attention_gate_func = getattr(config, "attention_gate_func", _CONFIG_ATTR_MISSING)
     if attention_gate_func is not _CONFIG_ATTR_MISSING:
@@ -293,10 +349,15 @@ def _normalize_k2_aurora_config(config: PretrainedConfig) -> None:
         rope_type = rope_parameters.get(
             "rope_type", rope_parameters.get("type", _CONFIG_ATTR_MISSING)
         )
-        if rope_type != "default":
+        if is_mova and rope_type != "default":
             raise ValueError(
                 "K2Aurora direct loading supports only explicit default "
                 f"rope_parameters, got rope_type={rope_type!r}"
+            )
+        if not is_mova and rope_type not in ("default", "yarn"):
+            raise ValueError(
+                "Dense K2Aurora direct loading supports only explicit default "
+                f"or yarn rope_parameters, got rope_type={rope_type!r}"
             )
         if (
             "rope_type" in rope_parameters
@@ -308,11 +369,17 @@ def _normalize_k2_aurora_config(config: PretrainedConfig) -> None:
             )
         rope_theta = rope_parameters.get("rope_theta", _CONFIG_ATTR_MISSING)
         if rope_theta is _CONFIG_ATTR_MISSING:
-            raise ValueError(
-                "K2Aurora default rope_parameters must explicitly provide " "rope_theta"
-            )
+            if is_mova:
+                raise ValueError(
+                    "K2Aurora default rope_parameters must explicitly provide "
+                    "rope_theta"
+                )
+            # Dense K2Aurora YaRN artifacts generated during the TF5 config
+            # transition persisted theta at the legacy top level only.
+            rope_theta = getattr(config, "rope_theta", _CONFIG_ATTR_MISSING)
         if (
-            isinstance(rope_theta, bool)
+            rope_theta is _CONFIG_ATTR_MISSING
+            or isinstance(rope_theta, bool)
             or not isinstance(rope_theta, (int, float))
             or not math.isfinite(rope_theta)
             or rope_theta <= 0
@@ -329,7 +396,113 @@ def _normalize_k2_aurora_config(config: PretrainedConfig) -> None:
         )
         default_rope_scaling = dict(rope_parameters)
         default_rope_scaling.pop("type", None)
-        default_rope_scaling["rope_type"] = "default"
+        default_rope_scaling["rope_theta"] = rope_theta
+        default_rope_scaling["rope_type"] = rope_type
+        if rope_type == "yarn":
+            supported_yarn_keys = {
+                "attention_factor",
+                "beta_fast",
+                "beta_slow",
+                "factor",
+                "original_max_position_embeddings",
+                "rope_theta",
+                "rope_type",
+                "truncate",
+                "type",
+            }
+            unknown_yarn_keys = set(rope_parameters) - supported_yarn_keys
+            if unknown_yarn_keys:
+                raise ValueError(
+                    "Dense K2Aurora YaRN has unsupported rope_parameters keys: "
+                    f"{sorted(unknown_yarn_keys)}"
+                )
+            factor = rope_parameters.get("factor", _CONFIG_ATTR_MISSING)
+            if (
+                isinstance(factor, bool)
+                or not isinstance(factor, (int, float))
+                or not math.isfinite(factor)
+                or factor <= 0
+            ):
+                raise ValueError(
+                    "Dense K2Aurora YaRN factor must be positive and finite, "
+                    f"got {factor!r}"
+                )
+            original_max_position_embeddings = rope_parameters.get(
+                "original_max_position_embeddings", _CONFIG_ATTR_MISSING
+            )
+            if (
+                isinstance(original_max_position_embeddings, bool)
+                or not isinstance(original_max_position_embeddings, int)
+                or original_max_position_embeddings <= 0
+            ):
+                raise ValueError(
+                    "Dense K2Aurora YaRN original_max_position_embeddings must "
+                    f"be a positive integer, got {original_max_position_embeddings!r}"
+                )
+            _set_k2_aurora_alias(
+                config,
+                source_name="rope_parameters.original_max_position_embeddings",
+                target_name="original_max_position_embeddings",
+                value=original_max_position_embeddings,
+            )
+            max_position_embeddings = getattr(
+                config, "max_position_embeddings", _CONFIG_ATTR_MISSING
+            )
+            expected_max_position_embeddings = factor * original_max_position_embeddings
+            if (
+                isinstance(max_position_embeddings, bool)
+                or not isinstance(max_position_embeddings, int)
+                or not math.isclose(
+                    max_position_embeddings,
+                    expected_max_position_embeddings,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise ValueError(
+                    "Dense K2Aurora YaRN requires max_position_embeddings == "
+                    "factor * original_max_position_embeddings; got "
+                    f"{max_position_embeddings!r} != "
+                    f"{expected_max_position_embeddings!r}"
+                )
+            for field, default in (("beta_fast", 32), ("beta_slow", 1)):
+                value = rope_parameters.get(field, default)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or value <= 0
+                ):
+                    raise ValueError(
+                        f"Dense K2Aurora YaRN {field} must be positive and "
+                        f"finite, got {value!r}"
+                    )
+            truncate = rope_parameters.get("truncate", True)
+            if not isinstance(truncate, bool):
+                raise ValueError(
+                    f"Dense K2Aurora YaRN truncate must be a bool, got {truncate!r}"
+                )
+            attention_factor = default_rope_scaling.pop("attention_factor", None)
+            if attention_factor is not None:
+                if (
+                    isinstance(attention_factor, bool)
+                    or not isinstance(attention_factor, (int, float))
+                    or not math.isfinite(attention_factor)
+                    or attention_factor <= 0
+                ):
+                    raise ValueError(
+                        "Dense K2Aurora YaRN attention_factor must be positive "
+                        f"and finite, got {attention_factor!r}"
+                    )
+                # HF's attention_factor is the final multiplier applied to
+                # cos/sin. SGLang's attn_factor multiplies its own standard
+                # YaRN mscale, so translate between those two conventions.
+                default_attention_factor = (
+                    1.0 if factor <= 1 else 0.1 * math.log(factor) + 1.0
+                )
+                default_rope_scaling["attn_factor"] = (
+                    attention_factor / default_attention_factor
+                )
         current_rope_scaling = getattr(config, "rope_scaling", _CONFIG_ATTR_MISSING)
         # Transformers 5 exposes rope_scaling as a property alias for the
         # original rope_parameters dictionary. That is the same source field,
@@ -343,6 +516,10 @@ def _normalize_k2_aurora_config(config: PretrainedConfig) -> None:
                 target_name="rope_scaling",
                 value=default_rope_scaling,
             )
+    elif not is_mova:
+        raise ValueError(
+            "Dense K2Aurora native loading requires explicit rope_parameters"
+        )
 
     mlp_only_layers = getattr(config, "mlp_only_layers", _CONFIG_ATTR_MISSING)
     if mlp_only_layers is not _CONFIG_ATTR_MISSING:
@@ -357,11 +534,22 @@ def _normalize_k2_aurora_config(config: PretrainedConfig) -> None:
                 "K2Aurora MoVA requires mlp_only_layers to be a contiguous "
                 f"prefix starting at zero, got {list(mlp_only_layers)}"
             )
+        if not is_mova and list(mlp_only_layers) != list(
+            range(config.num_hidden_layers)
+        ):
+            raise ValueError(
+                "Dense K2Aurora native loading requires every layer in "
+                "mlp_only_layers"
+            )
         _set_k2_aurora_alias(
             config,
             source_name="mlp_only_layers",
             target_name="num_dense_layers",
             value=len(mlp_only_layers),
+        )
+    elif not is_mova:
+        raise ValueError(
+            "Dense K2Aurora native loading requires explicit mlp_only_layers"
         )
 
     current_format = getattr(
@@ -495,6 +683,17 @@ def _validate_mova_config(
     """Fail early for phase-one combinations that cannot be served exactly."""
 
     if getattr(config, "num_values", 0) <= 0:
+        if _is_k2_aurora_hf_checkpoint(config):
+            if torch.get_default_dtype() != torch.bfloat16:
+                raise ValueError(
+                    "Dense K2Aurora requires --dtype bfloat16 because its "
+                    "persisted config reports float32 while the released "
+                    "weights are BF16"
+                )
+            if quant_config is not None:
+                raise ValueError(
+                    "Dense K2Aurora does not support quantized model weights"
+                )
         return
     if torch.get_default_dtype() != torch.bfloat16:
         raise ValueError(
@@ -1759,6 +1958,20 @@ class XllmForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = self.stacked_params_mapping
         expert_params_mapping = self.expert_params_mapping
+        strict_dense_k2 = (
+            _is_k2_aurora_hf_checkpoint(self.config)
+            and getattr(self.config, "num_values", 0) == 0
+        )
+
+        def is_pipeline_missing_dense_weight(name: str) -> bool:
+            if not strict_dense_k2:
+                return False
+            pp_group = getattr(self, "pp_group", None)
+            if pp_group is None:
+                return False
+            return (
+                name == "model.embed_tokens.weight" and not pp_group.is_first_rank
+            ) or (name == "model.norm.weight" and not pp_group.is_last_rank)
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
@@ -1784,6 +1997,12 @@ class XllmForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 if name.endswith(".bias") and name not in params_dict:
+                    if strict_dense_k2:
+                        raise RuntimeError(
+                            "Dense K2Aurora checkpoint weight did not resolve to "
+                            "a native model parameter: "
+                            f"checkpoint={checkpoint_name!r}, mapped={name!r}"
+                        )
                     continue
                 if name not in params_dict:
                     if (
@@ -1794,6 +2013,12 @@ class XllmForCausalLM(nn.Module):
                             "K2Aurora attention gate did not resolve to a model "
                             f"parameter: checkpoint={checkpoint_name!r}, "
                             f"mapped={name!r}"
+                        )
+                    if strict_dense_k2:
+                        raise RuntimeError(
+                            "Dense K2Aurora checkpoint weight did not resolve to "
+                            "a native model parameter: "
+                            f"checkpoint={checkpoint_name!r}, mapped={name!r}"
                         )
                     continue
 
@@ -1818,9 +2043,23 @@ class XllmForCausalLM(nn.Module):
                     )
                     break
                 else:
+                    if is_pipeline_missing_dense_weight(name):
+                        continue
                     if name.endswith(".bias") and name not in params_dict:
+                        if strict_dense_k2:
+                            raise RuntimeError(
+                                "Dense K2Aurora checkpoint weight did not resolve "
+                                "to a native model parameter: "
+                                f"checkpoint={checkpoint_name!r}, mapped={name!r}"
+                            )
                         continue
                     if name not in params_dict:
+                        if strict_dense_k2:
+                            raise RuntimeError(
+                                "Dense K2Aurora checkpoint weight did not resolve "
+                                "to a native model parameter: "
+                                f"checkpoint={checkpoint_name!r}, mapped={name!r}"
+                            )
                         continue
 
                     param = params_dict[name]

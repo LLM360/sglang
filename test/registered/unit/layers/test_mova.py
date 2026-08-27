@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.mova import (
     RoutedValueExperts,
@@ -34,6 +35,7 @@ from sglang.srt.models.xllm import (
     _xllm_stacked_params_mapping,
     _XllmMoVAAttentionBase,
 )
+from sglang.srt.utils.hf_transformers_utils import _K2AuroraConfig
 
 
 @pytest.fixture(autouse=True)
@@ -95,6 +97,43 @@ def _canonical_k2_aurora_config(**overrides):
         mlp_only_layers=[0, 1, 2],
         num_hidden_layers=48,
         xllm_source_router_gemm_partitions=2,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _canonical_dense_k2_aurora_config(**overrides):
+    values = dict(
+        architectures=["K2AuroraForCausalLM"],
+        hidden_size=1536,
+        intermediate_size=5120,
+        rms_norm_eps=1e-6,
+        layernorm_num_groups=1,
+        head_dim=64,
+        rope_head_dim=64,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        num_hidden_layers=28,
+        num_experts=0,
+        num_experts_per_tok=0,
+        num_shared_experts=0,
+        query_key_norm=False,
+        attention_gate_func=None,
+        sliding_window=None,
+        use_sliding_window=False,
+        rope_theta=1_000_000,
+        rope_parameters={
+            "attention_factor": 1.2772588722239782,
+            "beta_fast": 128,
+            "beta_slow": 4,
+            "factor": 16,
+            "original_max_position_embeddings": 8192,
+            "rope_type": "yarn",
+            "truncate": True,
+        },
+        max_position_embeddings=131072,
+        original_max_position_embeddings=8192,
+        mlp_only_layers=list(range(28)),
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -325,6 +364,167 @@ def test_k2_aurora_normalizes_only_canonical_schema_aliases():
     assert config.xllm_source_router_gemm_partitions == 2
 
 
+def test_k2_aurora_normalizes_dense_1b_yarn_schema():
+    config = _canonical_dense_k2_aurora_config()
+
+    _normalize_k2_aurora_config(config)
+
+    assert config.num_values == 0
+    assert config.num_values_per_tok == 0
+    assert config.apply_attn_gate is False
+    assert config.attn_gate_func is None
+    assert config.num_dense_layers == 28
+    assert config.rope_theta == 1_000_000
+    assert config.rope_scaling == {
+        "attn_factor": 1.0,
+        "beta_fast": 128,
+        "beta_slow": 4,
+        "factor": 16,
+        "original_max_position_embeddings": 8192,
+        "rope_theta": 1_000_000,
+        "rope_type": "yarn",
+        "truncate": True,
+    }
+    assert not hasattr(config, _XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY)
+    assert (
+        getattr(config, _XLLM_CHECKPOINT_FORMAT_CONFIG_KEY)
+        == _K2_AURORA_HF_CHECKPOINT_FORMAT
+    )
+
+
+def test_k2_aurora_normalizes_raw_dense_1b_fallback_config():
+    # Exact architecture-relevant fields persisted by xllm_1b_final/model.
+    # In particular, there are no mova_* fields and YaRN theta exists only at
+    # the legacy top level, which is what the native-only fallback sees.
+    config = _K2AuroraConfig.from_dict(
+        {
+            "architectures": ["K2AuroraForCausalLM"],
+            "attention_gate_func": None,
+            "head_dim": 64,
+            "hidden_size": 1536,
+            "intermediate_size": 5120,
+            "layernorm_num_groups": 1,
+            "max_position_embeddings": 131072,
+            "mlp_only_layers": list(range(28)),
+            "model_type": "k2_aurora",
+            "num_attention_heads": 32,
+            "num_experts": 0,
+            "num_experts_per_tok": 0,
+            "num_hidden_layers": 28,
+            "num_key_value_heads": 8,
+            "num_shared_experts": 0,
+            "original_max_position_embeddings": 8192,
+            "query_key_norm": False,
+            "rms_norm_eps": 1e-6,
+            "rope_head_dim": 64,
+            "rope_parameters": {
+                "attention_factor": 1.2772588722239782,
+                "beta_fast": 128,
+                "beta_slow": 4,
+                "factor": 16,
+                "original_max_position_embeddings": 8192,
+                "rope_type": "yarn",
+                "truncate": True,
+            },
+            "rope_theta": 1_000_000,
+            "sliding_window": None,
+            "use_sliding_window": False,
+            "vocab_size": 64256,
+        }
+    )
+
+    _normalize_k2_aurora_config(config)
+
+    assert config.architectures == ["K2AuroraForCausalLM"]
+    assert config.num_values == 0
+    assert config.num_dense_layers == 28
+    assert config.rope_scaling["rope_theta"] == 1_000_000
+    assert config.rope_scaling["attn_factor"] == pytest.approx(1.0)
+
+
+def test_k2_aurora_dense_yarn_preserves_hf_attention_factor():
+    attention_factor = 1.5
+    rope_parameters = dict(
+        _canonical_dense_k2_aurora_config().rope_parameters,
+        attention_factor=attention_factor,
+        original_max_position_embeddings=8,
+    )
+    config = _canonical_dense_k2_aurora_config(
+        max_position_embeddings=128,
+        original_max_position_embeddings=8,
+        rope_parameters=rope_parameters,
+    )
+    _normalize_k2_aurora_config(config)
+
+    rotary = get_rope(
+        config.head_dim,
+        rotary_dim=config.rope_head_dim,
+        max_position=config.max_position_embeddings,
+        base=config.rope_theta,
+        rope_scaling=config.rope_scaling,
+        is_neox_style=True,
+    )
+
+    assert rotary.mscale == pytest.approx(attention_factor)
+
+
+def test_k2_aurora_dense_1b_yarn_matches_hf_cache_beyond_8k():
+    config = _canonical_dense_k2_aurora_config()
+    _normalize_k2_aurora_config(config)
+    rotary = get_rope(
+        config.head_dim,
+        rotary_dim=config.rope_head_dim,
+        max_position=config.max_position_embeddings,
+        base=config.rope_theta,
+        rope_scaling=config.rope_scaling,
+        is_neox_style=True,
+        dtype=torch.float32,
+    )
+
+    rope = config.rope_parameters
+    dim = config.rope_head_dim
+    pos_freqs = config.rope_theta ** (
+        torch.arange(0, dim, 2, dtype=torch.float32) / dim
+    )
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    inv_freq_interpolation = 1.0 / (rope["factor"] * pos_freqs)
+
+    def correction_dim(num_rotations):
+        return (
+            dim
+            * math.log(
+                rope["original_max_position_embeddings"] / (num_rotations * 2 * math.pi)
+            )
+            / (2 * math.log(config.rope_theta))
+        )
+
+    low = max(math.floor(correction_dim(rope["beta_fast"])), 0)
+    high = min(math.ceil(correction_dim(rope["beta_slow"])), dim - 1)
+    ramp = torch.clamp(
+        (torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low),
+        0,
+        1,
+    )
+    extrapolation_mask = 1 - ramp
+    expected_inv_freq = (
+        inv_freq_interpolation * (1 - extrapolation_mask)
+        + inv_freq_extrapolation * extrapolation_mask
+    )
+
+    positions = torch.tensor([8192, 16384, 131071], dtype=torch.long)
+    frequencies = torch.outer(positions.float(), expected_inv_freq)
+    expected_cache = torch.cat((frequencies.cos(), frequencies.sin()), dim=-1)
+    expected_cache *= rope["attention_factor"]
+
+    assert rotary.cos_sin_cache.shape == (131072, 64)
+    torch.testing.assert_close(
+        rotary.cos_sin_cache.index_select(0, positions),
+        expected_cache,
+        rtol=2e-6,
+        atol=2e-6,
+    )
+
+
 def test_k2_aurora_class_applies_adapter_before_xllm_init(monkeypatch):
     config = _canonical_k2_aurora_config()
     observed = {}
@@ -366,12 +566,88 @@ def test_k2_aurora_requires_explicit_router_provenance_without_guessing():
     assert not hasattr(config, _XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY)
 
 
-@pytest.mark.parametrize("mova_num_experts", [0, -1, None, True])
-def test_k2_aurora_rejects_unsupported_non_mova_variants(mova_num_experts):
+@pytest.mark.parametrize("mova_num_experts", [-1, None, True, 1.5])
+def test_k2_aurora_rejects_invalid_mova_counts(mova_num_experts):
     config = _canonical_k2_aurora_config(mova_num_experts=mova_num_experts)
 
-    with pytest.raises(ValueError, match="supports canonical MoVA checkpoints only"):
+    with pytest.raises(ValueError, match="must be a non-negative integer"):
         _normalize_k2_aurora_config(config)
+
+
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        pytest.param(
+            {"attention_gate_func": "silu"},
+            "does not support gated attention",
+            id="canonical-attention-gate",
+        ),
+        pytest.param(
+            {"attention_gate_func": None, "apply_attn_gate": True},
+            "does not support gated attention",
+            id="native-attention-gate",
+        ),
+        pytest.param(
+            {"query_key_norm": True},
+            "does not support query/key normalization",
+            id="query-key-norm",
+        ),
+        pytest.param(
+            {"sliding_window": 4096},
+            "supports full causal attention only",
+            id="sliding-window-size",
+        ),
+        pytest.param(
+            {"use_sliding_window": True},
+            "supports full causal attention only",
+            id="sliding-window-enabled",
+        ),
+    ],
+)
+def test_k2_aurora_dense_rejects_unsupported_attention(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        _normalize_k2_aurora_config(_canonical_dense_k2_aurora_config(**overrides))
+
+
+def test_k2_aurora_dense_rejects_sparse_ffn_or_partial_dense_layers():
+    with pytest.raises(ValueError, match="requires num_experts=0"):
+        _normalize_k2_aurora_config(_canonical_dense_k2_aurora_config(num_experts=8))
+
+    with pytest.raises(ValueError, match="requires every layer"):
+        _normalize_k2_aurora_config(
+            _canonical_dense_k2_aurora_config(mlp_only_layers=list(range(27)))
+        )
+
+
+@pytest.mark.parametrize("rope_parameters", [None, "missing"])
+def test_k2_aurora_dense_requires_explicit_rope_parameters(rope_parameters):
+    config = _canonical_dense_k2_aurora_config(rope_parameters=rope_parameters)
+    if rope_parameters == "missing":
+        delattr(config, "rope_parameters")
+
+    with pytest.raises(ValueError, match="requires explicit rope_parameters"):
+        _normalize_k2_aurora_config(config)
+
+
+def test_k2_aurora_dense_rejects_conflicting_rope_theta_sources():
+    rope_parameters = dict(
+        _canonical_dense_k2_aurora_config().rope_parameters,
+        rope_theta=2_000_000,
+    )
+    with pytest.raises(ValueError, match="conflicting rope_parameters.rope_theta"):
+        _normalize_k2_aurora_config(
+            _canonical_dense_k2_aurora_config(rope_parameters=rope_parameters)
+        )
+
+
+def test_k2_aurora_dense_rejects_conflicting_original_context_sources():
+    with pytest.raises(
+        ValueError,
+        match="conflicting rope_parameters.original_max_position_embeddings",
+    ):
+        _normalize_k2_aurora_config(
+            _canonical_dense_k2_aurora_config(original_max_position_embeddings=4096)
+        )
 
 
 @pytest.mark.parametrize("experts_per_tok", [0, 65, None, True])
@@ -438,6 +714,16 @@ def test_k2_aurora_rejects_nondefault_nested_rope():
     )
 
     with pytest.raises(ValueError, match="only explicit default rope_parameters"):
+        _normalize_k2_aurora_config(config)
+
+
+def test_k2_aurora_mova_does_not_fallback_to_top_level_rope_theta():
+    config = _canonical_k2_aurora_config(
+        rope_theta=10_000_000.0,
+        rope_parameters={"rope_type": "default"},
+    )
+
+    with pytest.raises(ValueError, match="must explicitly provide rope_theta"):
         _normalize_k2_aurora_config(config)
 
 
@@ -915,6 +1201,24 @@ def test_mova_config_rejects_accidental_auto_fp16(monkeypatch):
         _validate_mova_config(_valid_mova_config(), quant_config=None)
 
 
+def test_dense_k2_aurora_config_requires_runtime_bfloat16(monkeypatch):
+    config = _canonical_dense_k2_aurora_config()
+    _normalize_k2_aurora_config(config)
+
+    monkeypatch.setattr(
+        "sglang.srt.models.xllm.torch.get_default_dtype", lambda: torch.float32
+    )
+    with pytest.raises(ValueError, match="--dtype bfloat16"):
+        _validate_mova_config(config, quant_config=None)
+
+    monkeypatch.setattr(
+        "sglang.srt.models.xllm.torch.get_default_dtype", lambda: torch.bfloat16
+    )
+    _validate_mova_config(config, quant_config=None)
+    with pytest.raises(ValueError, match="does not support quantized"):
+        _validate_mova_config(config, quant_config=SimpleNamespace())
+
+
 def test_softplus_attention_gate_uses_ln2_beta():
     gate = torch.tensor([-2.0, 0.0, 2.0])
     module = SimpleNamespace(attn_gate_func="softplus")
@@ -989,6 +1293,82 @@ def test_mova_parameter_mapper_stages_qkg_and_all_value_experts():
     assert router.num_shards == 1
 
 
+def test_k2_aurora_dense_1b_uses_standard_xllm_weight_mapping():
+    config = _canonical_dense_k2_aurora_config()
+    _normalize_k2_aurora_config(config)
+    model = SimpleNamespace(
+        stacked_params_mapping=_xllm_stacked_params_mapping(config),
+        expert_params_mapping=[],
+    )
+    mapper = ParameterMapper.from_model(model)
+
+    for source, shard_id in (
+        ("q_proj", "q"),
+        ("k_proj", "k"),
+        ("v_proj", "v"),
+    ):
+        mapped = mapper.map(f"model.layers.27.self_attn.{source}.weight")
+        assert mapped.sglang_name == "model.layers.27.self_attn.qkv_proj.weight"
+        assert mapped.shard_id == shard_id
+        assert mapped.num_shards == 3
+
+    for source, shard_id in (("gate_proj", 0), ("up_proj", 1)):
+        mapped = mapper.map(f"model.layers.27.mlp.{source}.weight")
+        assert mapped.sglang_name == "model.layers.27.mlp.gate_up_proj.weight"
+        assert mapped.shard_id == shard_id
+        assert mapped.num_shards == 2
+
+    for unchanged in (
+        "lm_head.weight",
+        "model.embed_tokens.weight",
+        "model.layers.27.input_layernorm.weight",
+        "model.layers.27.post_attention_layernorm.weight",
+        "model.layers.27.self_attn.o_proj.weight",
+        "model.layers.27.mlp.down_proj.weight",
+        "model.norm.weight",
+    ):
+        mapped = mapper.map(unchanged)
+        assert mapped.sglang_name == unchanged
+        assert mapped.num_shards == 1
+
+    indexed_names = {
+        "lm_head.weight",
+        "model.embed_tokens.weight",
+        "model.norm.weight",
+    }
+    expected_native_names = set(indexed_names)
+    for layer_id in range(28):
+        prefix = f"model.layers.{layer_id}"
+        indexed_names.update(
+            {
+                f"{prefix}.input_layernorm.weight",
+                f"{prefix}.post_attention_layernorm.weight",
+                f"{prefix}.self_attn.q_proj.weight",
+                f"{prefix}.self_attn.k_proj.weight",
+                f"{prefix}.self_attn.v_proj.weight",
+                f"{prefix}.self_attn.o_proj.weight",
+                f"{prefix}.mlp.gate_proj.weight",
+                f"{prefix}.mlp.up_proj.weight",
+                f"{prefix}.mlp.down_proj.weight",
+            }
+        )
+        expected_native_names.update(
+            {
+                f"{prefix}.input_layernorm.weight",
+                f"{prefix}.post_attention_layernorm.weight",
+                f"{prefix}.self_attn.qkv_proj.weight",
+                f"{prefix}.self_attn.o_proj.weight",
+                f"{prefix}.mlp.gate_up_proj.weight",
+                f"{prefix}.mlp.down_proj.weight",
+            }
+        )
+
+    mapped_native_names = {mapper.map(name).sglang_name for name in indexed_names}
+    assert len(indexed_names) == 255
+    assert mapped_native_names == expected_native_names
+    assert len(mapped_native_names) == 171
+
+
 def test_k2_aurora_parameter_mapper_scopes_attention_gate_alias():
     config = _canonical_k2_aurora_config()
     _normalize_k2_aurora_config(config)
@@ -1039,6 +1419,103 @@ def test_k2_aurora_loader_does_not_silently_drop_attention_gate():
                 )
             ],
         )
+
+
+def test_k2_aurora_dense_loader_keeps_qk_rows_unpermuted():
+    config = _canonical_dense_k2_aurora_config()
+    _normalize_k2_aurora_config(config)
+    recorded = {}
+    qkv = torch.nn.Parameter(torch.empty(1), requires_grad=False)
+
+    def record_loader(param, loaded_weight, shard_id):
+        assert param is qkv
+        recorded[shard_id] = loaded_weight.clone()
+
+    qkv.weight_loader = record_loader
+    model = SimpleNamespace(
+        config=config,
+        stacked_params_mapping=_xllm_stacked_params_mapping(config),
+        expert_params_mapping=[],
+        model=SimpleNamespace(start_layer=0, end_layer=config.num_hidden_layers),
+        named_parameters=lambda: [("model.layers.0.self_attn.qkv_proj.weight", qkv)],
+    )
+    query_rows = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    key_rows = torch.arange(100, 108, dtype=torch.float32).reshape(4, 2)
+
+    XllmForCausalLM.load_weights(
+        model,
+        [
+            ("model.layers.0.self_attn.q_proj.weight", query_rows),
+            ("model.layers.0.self_attn.k_proj.weight", key_rows),
+        ],
+    )
+
+    torch.testing.assert_close(recorded["q"], query_rows, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(recorded["k"], key_rows, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize(
+    "checkpoint_name",
+    [
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.unexpected.weight",
+    ],
+)
+def test_k2_aurora_dense_loader_rejects_unresolved_weights(checkpoint_name):
+    config = _canonical_dense_k2_aurora_config()
+    _normalize_k2_aurora_config(config)
+    model = SimpleNamespace(
+        config=config,
+        stacked_params_mapping=_xllm_stacked_params_mapping(config),
+        expert_params_mapping=[],
+        model=SimpleNamespace(start_layer=0, end_layer=config.num_hidden_layers),
+        named_parameters=lambda: [],
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint weight did not resolve"):
+        XllmForCausalLM.load_weights(
+            model,
+            [(checkpoint_name, torch.empty(1))],
+        )
+
+
+def test_k2_aurora_dense_loader_allows_pipeline_missing_global_weights():
+    config = _canonical_dense_k2_aurora_config()
+    _normalize_k2_aurora_config(config)
+    model = SimpleNamespace(
+        config=config,
+        stacked_params_mapping=_xllm_stacked_params_mapping(config),
+        expert_params_mapping=[],
+        model=SimpleNamespace(start_layer=10, end_layer=20),
+        pp_group=SimpleNamespace(is_first_rank=False, is_last_rank=False),
+        named_parameters=lambda: [],
+    )
+
+    XllmForCausalLM.load_weights(
+        model,
+        [
+            ("model.embed_tokens.weight", torch.empty(1)),
+            ("model.norm.weight", torch.empty(1)),
+        ],
+    )
+
+
+def test_k2_aurora_dense_group_one_uses_standard_rms_norm():
+    config = _canonical_dense_k2_aurora_config(hidden_size=4)
+    _normalize_k2_aurora_config(config)
+    norm = _make_norm(config)
+
+    assert isinstance(norm, RMSNorm)
+    assert not isinstance(norm, XllmGroupRMSNorm)
+    weight = torch.tensor([1.0, 1.5, 0.5, 2.0])
+    with torch.no_grad():
+        norm.weight.copy_(weight)
+    hidden = torch.tensor([[3.0, 4.0, 0.0, 5.0]])
+    expected = hidden * torch.rsqrt(
+        hidden.square().mean(dim=-1, keepdim=True) + config.rms_norm_eps
+    )
+    expected *= weight
+    torch.testing.assert_close(norm.forward_native(hidden), expected)
 
 
 def test_k2_aurora_norms_load_one_centered_weights_directly():
