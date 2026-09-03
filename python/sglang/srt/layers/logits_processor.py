@@ -84,6 +84,13 @@ class LogitsProcessorOutput:
         List[Union[List[float], torch.Tensor]]
     ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
+    # The token ids kept by top-k/top-p/min-p truncation at sampling time, per
+    # row (rollout-side nucleus, for RL training to replay the same support
+    # the token was actually sampled from). Populated only for rows whose
+    # request sets custom_params={"return_nucleus_token_ids": True}; pytorch
+    # backend only. shape: [#seq] (each entry an int32 tensor, or None for
+    # rows that didn't request it)
+    next_token_nucleus_token_ids: Optional[List[Optional[torch.Tensor]]] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]

@@ -63,6 +63,74 @@ def compute_temp_top_p_normalized_logprobs(
         return torch.nn.functional.log_softmax(last_logits, dim=-1)
 
 
+def get_nucleus_token_ids_from_probs_torch(
+    probs: torch.Tensor,
+    request_mask: List[bool],
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+) -> List[Optional[torch.Tensor]]:
+    """
+    Token ids kept by top-k/top-p/min-p sampling, per row (pytorch backend only).
+
+    Mirrors top_k_top_p_min_p_sampling_from_probs_torch's truncation rule
+    (see sampler.py). Like that function, top_ks/top_ps/min_ps are expected to already be fully
+    resolved per-row tensors -- e.g. straight from SamplingBatchInfo, which
+    itself resolves them once per request in SamplingParams.__init__ (TOP_K_ALL
+    /1.0/0.0 for rows that don't use that filter). Not setting default values 
+    for 'top_ks', 'top_ps', 'min_ps'.
+    
+
+    Args:
+        probs: Post-softmax, pre-truncation probabilities. Shape [batch, vocab].
+        request_mask: Which rows to compute/return the nucleus for (requests
+            that opted in via custom_params={"return_nucleus_token_ids": True}).
+        top_ks: Per-row top-k cutoff (TOP_K_ALL if unused). Shape [batch].
+        top_ps: Per-row top-p cutoff (1.0 if unused). Shape [batch]; only read
+            when `need_top_p_sampling` is True.
+        min_ps: Per-row min-p cutoff (0 if unused). Shape [batch]; only read
+            when `need_min_p_sampling` is True.
+        need_top_p_sampling: Whether any row in the batch uses top-p; if False,
+            the top_ps cutoff is skipped for every row.
+        need_min_p_sampling: Whether any row in the batch uses min-p; if False,
+            the min_ps cutoff is skipped for every row.
+
+    Returns:
+        A list of length `batch`, where element i is the kept token ids for
+        row i if `request_mask[i]` is True, else None.
+    """
+    if not any(request_mask):
+        # No row asked for its nucleus back -- still return one entry per row
+        # so callers can always index the result by row.
+        return [None] * probs.shape[0]
+
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True) # probs_sort shape: [batch, vocab_size]
+
+    ## top-k sampling: keep the tokens whose rank is below the per-row top-k threshold (top_ks)
+    ranks = torch.arange(probs_sort.shape[-1], device=probs.device).view(1, -1) # shape [1, vocab_size]
+    keep = ranks < top_ks.view(-1, 1) # use broadcasting to compare [1, vocab_size] with [batch, 1] to get a [batch, vocab_size] boolean tensor
+
+    ## top-p sampling: keep the tokens whose cumulative probability is below the per-row top-p threshold (top_ps)
+    if need_top_p_sampling:
+        # cumulative sum of the sorted probabilities, excluding the current probability
+        prefix_sum = torch.cumsum(probs_sort, dim=-1) - probs_sort # shape [batch, vocab_size]
+        keep_top_p = prefix_sum <= top_ps.view(-1, 1) # again use the broadcasting trick to compare [batch, vocab_size] with [batch, 1] to get a [batch, vocab_size] boolean tensor
+        keep = keep & keep_top_p # combine the top-k and top-p masks using element-wise logical AND
+
+    ## min-p sampling: keep the tokens whose probabilities are above the per-row minimum probability threshold (min_ps percentage of the most likely token's probability)
+    if need_min_p_sampling:
+        threshold = (probs_sort[:, 0] * min_ps).view(-1, 1) # shape [batch, 1]
+        keep_min_p = probs_sort >= threshold # shape [batch, vocab_size]
+        keep = keep & keep_min_p # combine the top-k, top-p and min-p masks using element-wise logical AND
+
+    return [
+        probs_idx[i][keep[i]].to(torch.int32) if request_mask[i] else None
+        for i in range(probs.shape[0])
+    ]
+
+
 def get_top_logprobs_raw(
     logprobs: torch.Tensor,
     top_logprobs_nums: List[int],

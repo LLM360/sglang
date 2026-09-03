@@ -12,7 +12,11 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.hash import murmur_hash32
-from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.layers.utils.logprob import (
+    get_token_ids_logprobs,
+    get_top_logprobs,
+    get_nucleus_token_ids_from_probs_torch,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
@@ -54,6 +58,9 @@ class Sampler(nn.Module):
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
+        # Cached for the top-p nucleus replay path below, which is currently
+        # only implemented for the pytorch fallback backend.
+        self.sampling_backend = get_global_server_args().sampling_backend
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -151,6 +158,39 @@ class Sampler(nn.Module):
                 # In-place op to save memory
                 logits[:] = torch.softmax(logits, dim=-1)
                 probs = logits
+
+                # Nucleus replay for RL training (pytorch backend only): for
+                # rows that opted in via custom_params, expose the exact
+                # vocab ids top-k/top-p/min-p truncation kept, on the same
+                # (pre-truncation) probs the sampler is about to sample from.
+                # Computed before sampling so it's unaffected by whatever
+                # _sample_from_probs does internally. Gated on return_logprob
+                # like the rest of the logprob-family outputs below (this data
+                # is meaningless without the logprobs it accompanies in the
+                # training loss) -- keeps it consistent with copy_to_cpu() in
+                # managers/utils.py, which only copies this to CPU when
+                # return_logprob is set.
+                if (
+                    return_logprob
+                    and not simple_sampling_case
+                    and self.sampling_backend == "pytorch"
+                    and sampling_info.custom_params is not None
+                ):
+                    request_mask = [
+                        bool(p and p.get("return_nucleus_token_ids"))
+                        for p in sampling_info.custom_params
+                    ]
+                    logits_output.next_token_nucleus_token_ids = (
+                        get_nucleus_token_ids_from_probs_torch(
+                            probs=probs,
+                            request_mask=request_mask,
+                            top_ks=sampling_info.top_ks,
+                            top_ps=sampling_info.top_ps,
+                            min_ps=sampling_info.min_ps,
+                            need_top_p_sampling=sampling_info.need_top_p_sampling,
+                            need_min_p_sampling=sampling_info.need_min_p_sampling,
+                        )
+                    )
 
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case
