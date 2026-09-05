@@ -776,12 +776,17 @@ class Req(ReqDllmMixin):
                 Union[List[float], torch.Tensor]
             ] = []
             self.output_token_ids_logprobs_idx = []
+            # Top-p/top-k/min-p nucleus replay for RL training, one entry per
+            # output token: List[int] if this request opted in via
+            # custom_params={"return_nucleus_token_ids": True} and this token's
+            # row had one, else None. Empty for requests that never opted in.
+            self.output_nucleus_token_ids: List[Optional[List[int]]] = []
         else:
             self.output_token_logprobs_val = self.output_token_logprobs_idx = (
                 self.output_top_logprobs_val
             ) = self.output_top_logprobs_idx = self.output_token_ids_logprobs_val = (
                 self.output_token_ids_logprobs_idx
-            ) = None
+            ) = self.output_nucleus_token_ids = None
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None

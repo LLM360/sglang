@@ -158,6 +158,12 @@ class ReqState:
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
 
+    # Top-k/top-p/min-p nucleus replay for RL training, accumulated across
+    # chunks like the fields above. No separate "detokenized" form needed --
+    # unlike token_ids_logprobs this is consumed as raw vocab ids by the
+    # training side, not decoded into text.
+    output_nucleus_token_ids: List = dataclasses.field(default_factory=list)
+
     # For detokenized logprobs
     input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
     output_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
@@ -1835,6 +1841,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         state.output_token_logprobs_idx.extend(
             recv_obj.output_token_logprobs_idx[recv_obj_index]
         )
+        # Unconditional like the fields above -- empty for requests that
+        # never opted into nucleus replay, so nothing to gate on here.
+        state.output_nucleus_token_ids.extend(
+            recv_obj.output_nucleus_token_ids[recv_obj_index]
+        )
+        meta_info["output_nucleus_token_ids"] = state.output_nucleus_token_ids
 
         if top_logprobs_num > 0:
             if len(recv_obj.input_top_logprobs_val) > 0:

@@ -166,6 +166,14 @@ class SchedulerOutputProcessorMixin:
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
+                if logits_output.next_token_nucleus_token_ids:
+                    # Per-row entries are int32 CUDA tensors, or None for rows
+                    # that didn't opt in (see get_nucleus_token_ids_from_probs_torch
+                    # in python/sglang/srt/layers/utils/logprob.py).
+                    logits_output.next_token_nucleus_token_ids = [
+                        v.tolist() if v is not None else None
+                        for v in logits_output.next_token_nucleus_token_ids
+                    ]
 
             hidden_state_offset = 0
 
@@ -177,6 +185,7 @@ class SchedulerOutputProcessorMixin:
                     # decode req in mixed batch or retracted req
                     continue
 
+                # Prefill finished so the generation req can be streamed. For chunked requests (i.e. with long prompts), we only stream when the last chunk is finished.
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
 
@@ -186,7 +195,7 @@ class SchedulerOutputProcessorMixin:
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
                     req.check_finished()
-                    if req.finished():
+                    if req.finished():  # update requests finished state and collect metrics
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
@@ -208,7 +217,8 @@ class SchedulerOutputProcessorMixin:
                         )
 
                         if req.return_logprob:
-                            self.add_logprob_return_values(
+                            # 'add_logprob_return_values' function manages returning logprobs and other request specific data (for example, token ids in the nucleus for top p sammplig).
+                            self.add_logprob_return_values( 
                                 i,
                                 req,
                                 logprob_pt,
@@ -406,6 +416,11 @@ class SchedulerOutputProcessorMixin:
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
+                if logits_output.next_token_nucleus_token_ids:
+                    logits_output.next_token_nucleus_token_ids = [
+                        v.tolist() if v is not None else None
+                        for v in logits_output.next_token_nucleus_token_ids
+                    ]
         else:
             # for normal spec decoding: unify next_token_ids format
             next_token_ids = []
@@ -518,6 +533,18 @@ class SchedulerOutputProcessorMixin:
                         )
                         req.output_token_ids_logprobs_idx.append(
                             logits_output.next_token_token_ids_logprobs_idx[flat_idx]
+                        )
+                    if logits_output.next_token_nucleus_token_ids is not None:
+                        # Always append, even when this flat position is None
+                        # (e.g. a row that didn't opt in) -- keeps this list's
+                        # length equal to the number of generated tokens, so
+                        # entry k always corresponds to output token k. Only
+                        # requests that never opted in skip this whole block
+                        # (guarded above), leaving their list empty rather
+                        # than partially populated.
+                        flat_idx = i * max_accept + j
+                        req.output_nucleus_token_ids.append(
+                            logits_output.next_token_nucleus_token_ids[flat_idx]
                         )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
@@ -871,6 +898,17 @@ class SchedulerOutputProcessorMixin:
                 output.next_token_token_ids_logprobs_idx[i]
             )
 
+        if output.next_token_nucleus_token_ids is not None:
+            # Always append, even when this row is None even if the request opted in for top-p token ids --- 
+            # it should ideally never happen given that opt-in is fixed per-request, but if it ever does,
+            # an explicit None at the right position is still matched in terms of shape.
+            # Requests that never opted in at all skip this whole block (output.next_token_nucleus_token_ids 
+            # is None for the batch), leaving their list empty instead.
+            nucleus_token_ids = output.next_token_nucleus_token_ids[i]
+            if isinstance(nucleus_token_ids, torch.Tensor):
+                nucleus_token_ids = nucleus_token_ids.tolist()
+            req.output_nucleus_token_ids.append(nucleus_token_ids)
+
         return num_input_logprobs
 
     def _initialize_empty_logprob_containers(self: Scheduler, req: Req) -> None:
@@ -969,6 +1007,7 @@ class SchedulerOutputProcessorMixin:
             input_token_ids_logprobs_idx = []
             output_token_ids_logprobs_val = []
             output_token_ids_logprobs_idx = []
+            output_nucleus_token_ids = []
         else:
             input_token_logprobs_val = input_token_logprobs_idx = (
                 output_token_logprobs_val
@@ -978,7 +1017,7 @@ class SchedulerOutputProcessorMixin:
                 input_token_ids_logprobs_val
             ) = input_token_ids_logprobs_idx = output_token_ids_logprobs_val = (
                 output_token_ids_logprobs_idx
-            ) = None
+            ) = output_nucleus_token_ids = None
 
         for req in reqs:
             if req is skip_req:
@@ -1118,6 +1157,13 @@ class SchedulerOutputProcessorMixin:
                                 send_output_token_logprobs_offset:logprob_end
                             ]
                         )
+                        # Same offset as the logprob fields above -- one entry
+                        # per output token, so it slices the same way.
+                        output_nucleus_token_ids.append(
+                            req.output_nucleus_token_ids[
+                                send_output_token_logprobs_offset:logprob_end
+                            ]
+                        )
                         req.send_output_token_logprobs_offset = logprob_end
                     else:
                         output_token_logprobs_val.append([])
@@ -1126,6 +1172,7 @@ class SchedulerOutputProcessorMixin:
                         output_top_logprobs_idx.append([])
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
+                        output_nucleus_token_ids.append([])
 
                 if req.return_hidden_states:
                     if output_hidden_states is None:
@@ -1190,6 +1237,7 @@ class SchedulerOutputProcessorMixin:
                     input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
                     output_token_ids_logprobs_val=output_token_ids_logprobs_val,
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
+                    output_nucleus_token_ids=output_nucleus_token_ids,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,

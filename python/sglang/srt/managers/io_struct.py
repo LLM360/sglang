@@ -995,6 +995,10 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     output_token_ids_logprobs_val: List[List]
     output_token_ids_logprobs_idx: List[List]
     output_token_entropy_val: List[float]
+    # Top-k/top-p/min-p nucleus replay for RL training: per request, the list
+    # of kept vocab ids for each output token (or None per token for rows
+    # that didn't opt in). See Req.output_nucleus_token_ids.
+    output_nucleus_token_ids: List[List]
 
     # Hidden states
     output_hidden_states: List[List[float]]
@@ -1057,6 +1061,10 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     output_token_ids_logprobs_val: List[List]
     output_token_ids_logprobs_idx: List[List]
     output_token_entropy_val: List[float]
+    # Top-k/top-p/min-p nucleus replay for RL training: per request, the list
+    # of kept vocab ids for each output token (or None per token for rows
+    # that didn't opt in). See Req.output_nucleus_token_ids.
+    output_nucleus_token_ids: List[List]
 
     # Hidden states
     output_hidden_states: List[List[float]]
@@ -1407,6 +1415,8 @@ class InitWeightsUpdateGroupReqInput(BaseReq):
     group_name: str = "weight_update_group"
     # The backend
     backend: str = "nccl"
+    # Process group init timeout in seconds (falls back to torch's default_pg_timeout if None)
+    timeout_seconds: Optional[float] = None
 
 
 @dataclass
