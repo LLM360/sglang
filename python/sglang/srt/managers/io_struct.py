@@ -247,6 +247,7 @@ class GenerateReqInput(BaseReq):
     min_dynamic_patch: Optional[int] = None
     image_max_dynamic_patch: Optional[int] = None
     video_max_dynamic_patch: Optional[int] = None
+    return_sampling_mask: Optional[Union[List[bool], bool]] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -366,6 +367,8 @@ class GenerateReqInput(BaseReq):
             self.rid = uuid.uuid4().hex
         if self.return_logprob is None:
             self.return_logprob = False
+        if self.return_sampling_mask is None:
+            self.return_sampling_mask = False
         if self.logprob_start_len is None:
             self.logprob_start_len = -1
         if self.top_logprobs_num is None:
@@ -529,6 +532,9 @@ class GenerateReqInput(BaseReq):
         self.return_logprob = normalize_param(
             self.return_logprob, False, "return_logprob"
         )
+        self.return_sampling_mask = normalize_param(
+            self.return_sampling_mask, False, "return_sampling_mask"
+        )
         self.logprob_start_len = normalize_param(
             self.logprob_start_len, -1, "logprob_start_len"
         )
@@ -616,6 +622,7 @@ class GenerateReqInput(BaseReq):
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
             return_logprob=self.return_logprob[i],
+            return_sampling_mask=self.return_sampling_mask[i],
             logprob_start_len=self.logprob_start_len[i],
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
@@ -753,6 +760,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
+
+    return_sampling_mask: bool = False
 
 
 @dataclass
@@ -1027,6 +1036,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
+    output_token_sampling_mask: Optional[List[List[List[int]]]] = None
+    output_token_sampling_logprobs: Optional[List[List[float]]] = None
+
 
 @dataclass
 class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
@@ -1089,6 +1101,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
+    output_token_sampling_mask: Optional[List[List[List[int]]]] = None
+    output_token_sampling_logprobs: Optional[List[List[float]]] = None
 
 
 @dataclass

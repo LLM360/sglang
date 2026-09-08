@@ -594,6 +594,7 @@ class Req(ReqDllmMixin):
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
+        return_sampling_mask: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -738,6 +739,14 @@ class Req(ReqDllmMixin):
         # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
+
+        self.return_sampling_mask: bool = return_sampling_mask
+        self.output_token_sampling_mask: Optional[List[List[int]]] = (
+            [] if return_sampling_mask else None
+        )
+        self.output_token_sampling_logprobs: Optional[List[float]] = (
+            [] if return_sampling_mask else None
+        )
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob

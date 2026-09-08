@@ -3,13 +3,21 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import requests
 import torch
 
 from sglang.srt.layers import sampler as sampler_module
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    popen_launch_server,
+)
 
 register_cuda_ci(est_time=180, suite="stage-b-test-1-gpu-small")
 
@@ -90,6 +98,18 @@ class TestSamplingMask(unittest.TestCase):
         expected_logprob = math.log(probs[token_with] / support_mass)
         self.assertAlmostEqual(sampling_logprob, expected_logprob, places=6)
 
+    def _assert_api_alignment(self, output_ids, meta_info):
+        masks = meta_info["output_token_sampling_mask"]
+        logprobs = meta_info["output_token_sampling_logprobs"]
+        self.assertEqual(len(masks), len(output_ids))
+        self.assertEqual(len(logprobs), len(output_ids))
+        self.assertEqual(
+            meta_info["output_token_sampling_mask_length"], len(output_ids)
+        )
+        for output_id, mask, logprob in zip(output_ids, masks, logprobs):
+            self.assertIn(output_id, mask)
+            self.assertTrue(math.isfinite(logprob))
+
     def test_pytorch_sampler_correctness(self):
         cases = [
             ("pure_top_p", [0.4, 0.3, 0.2, 0.1], TOP_K_ALL, 0.6, 0.0, {0, 1}),
@@ -147,6 +167,226 @@ class TestSamplingMask(unittest.TestCase):
                 self._assert_sampler_case(
                     "flashinfer", probs, top_k, top_p, min_p, support
                 )
+
+    def test_public_api_contract(self):
+        model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        base_url = DEFAULT_URL_FOR_TEST
+        process = popen_launch_server(
+            model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--mem-fraction-static",
+                "0.7",
+                "--chunked-prefill-size",
+                "4",
+                "--tokenizer-worker-num",
+                2,
+            ],
+        )
+        try:
+            sampling_params = {
+                "temperature": 1.0,
+                "top_p": 0.8,
+                "top_k": -1,
+                "max_new_tokens": 3,
+                "ignore_eos": True,
+            }
+            response = requests.post(
+                base_url + "/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": sampling_params,
+                    "return_sampling_mask": True,
+                },
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            generate_output = response.json()
+            self.assertEqual(len(generate_output["output_ids"]), 3)
+            self._assert_api_alignment(
+                generate_output["output_ids"], generate_output["meta_info"]
+            )
+
+            session_id = requests.post(
+                base_url + "/open_session",
+                json={"capacity_of_str_len": 1000},
+                timeout=60,
+            ).json()
+            session_payload = {
+                "text": "Generate within a session.",
+                "session_params": {"id": session_id},
+                "sampling_params": {**sampling_params, "max_new_tokens": 1},
+                "return_sampling_mask": True,
+            }
+            response = requests.post(
+                base_url + "/generate",
+                json=session_payload,
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            session_output = response.json()
+            self.assertEqual(len(session_output["output_ids"]), 1)
+            self._assert_api_alignment(
+                session_output["output_ids"], session_output["meta_info"]
+            )
+            response = requests.post(
+                base_url + "/generate",
+                json={
+                    **session_payload,
+                    "session_params": {"id": session_id + "-missing"},
+                },
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 400, response.text)
+
+            response = requests.post(
+                base_url + "/generate",
+                json={
+                    "text": "Cache this prefix without decoding.",
+                    "sampling_params": {
+                        **sampling_params,
+                        "max_new_tokens": 0,
+                    },
+                    "return_sampling_mask": True,
+                },
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            prefill_only_output = response.json()
+            self.assertEqual(prefill_only_output["output_ids"], [])
+            self._assert_api_alignment(
+                prefill_only_output["output_ids"], prefill_only_output["meta_info"]
+            )
+
+            response = requests.post(
+                base_url + "/v1/chat/completions",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Name a capital city."}],
+                    "temperature": 1.0,
+                    "top_p": 0.8,
+                    "top_k": -1,
+                    "max_tokens": 3,
+                    "ignore_eos": True,
+                    "return_sampling_mask": True,
+                    "return_meta_info": True,
+                    "return_completion_token_ids": True,
+                },
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            choice = response.json()["choices"][0]
+            self.assertEqual(len(choice["completion_token_ids"]), 3)
+            self._assert_api_alignment(
+                choice["completion_token_ids"], choice["meta_info"]
+            )
+
+            greedy_payload = {
+                "text": "The capital of Germany is",
+                "sampling_params": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": 1,
+                    "max_new_tokens": 3,
+                    "ignore_eos": True,
+                },
+                "return_logprob": True,
+            }
+            without_mask = requests.post(
+                base_url + "/generate", json=greedy_payload, timeout=60
+            )
+            with_mask = requests.post(
+                base_url + "/generate",
+                json={**greedy_payload, "return_sampling_mask": True},
+                timeout=60,
+            )
+            self.assertEqual(without_mask.status_code, 200, without_mask.text)
+            self.assertEqual(with_mask.status_code, 200, with_mask.text)
+            without_mask = without_mask.json()
+            with_mask = with_mask.json()
+            self.assertEqual(with_mask["output_ids"], without_mask["output_ids"])
+            self.assertEqual(
+                with_mask["meta_info"]["output_token_logprobs"],
+                without_mask["meta_info"]["output_token_logprobs"],
+            )
+            self._assert_api_alignment(with_mask["output_ids"], with_mask["meta_info"])
+            for key in (
+                "output_token_sampling_mask",
+                "output_token_sampling_logprobs",
+                "output_token_sampling_mask_length",
+            ):
+                self.assertNotIn(key, without_mask["meta_info"])
+
+            rejected_rid = "sampling-mask-rejection"
+            response = requests.post(
+                base_url + "/generate",
+                json={
+                    "rid": rejected_rid,
+                    "text": "Reject this request",
+                    "sampling_params": {
+                        "top_p": 1.0,
+                        "top_k": -1,
+                        "min_p": 0.0,
+                        "max_new_tokens": 1,
+                    },
+                    "return_sampling_mask": True,
+                },
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 400, response.text)
+
+            response = requests.post(
+                base_url + "/generate",
+                json={
+                    "rid": rejected_rid,
+                    "text": "Retry this request",
+                    "sampling_params": {
+                        "top_p": 0.8,
+                        "top_k": -1,
+                        "max_new_tokens": 1,
+                        "ignore_eos": True,
+                    },
+                    "return_sampling_mask": True,
+                },
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            retry_output = response.json()
+            self.assertEqual(len(retry_output["output_ids"]), 1)
+            self._assert_api_alignment(
+                retry_output["output_ids"], retry_output["meta_info"]
+            )
+
+            response = requests.post(
+                base_url + "/generate",
+                json={
+                    "text": "Reject streaming.",
+                    "sampling_params": sampling_params,
+                    "stream": True,
+                    "return_sampling_mask": True,
+                },
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 400, response.text)
+
+            response = requests.post(
+                base_url + "/v1/chat/completions",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Reject streaming."}],
+                    "top_p": 0.8,
+                    "top_k": -1,
+                    "max_tokens": 1,
+                    "stream": True,
+                    "return_sampling_mask": True,
+                    "return_meta_info": True,
+                },
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 400, response.text)
+        finally:
+            kill_process_tree(process.pid)
 
 
 if __name__ == "__main__":

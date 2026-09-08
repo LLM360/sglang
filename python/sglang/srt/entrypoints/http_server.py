@@ -696,6 +696,16 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    return_sampling_mask = obj.return_sampling_mask
+    if obj.stream and (
+        any(return_sampling_mask)
+        if isinstance(return_sampling_mask, list)
+        else return_sampling_mask
+    ):
+        return _create_error_response(
+            "return_sampling_mask is not supported with streaming."
+        )
+
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:

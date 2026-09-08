@@ -169,6 +169,9 @@ class SamplingBatchInfo:
             },
         )
 
+        return_sampling_masks = [
+            r.return_sampling_mask and r is not batch.chunked_req for r in reqs
+        ]
         ret = cls(
             temperatures=temperatures,
             top_ps=top_ps,
@@ -186,6 +189,9 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
+            return_sampling_masks=(
+                return_sampling_masks if any(return_sampling_masks) else None
+            ),
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -290,6 +296,13 @@ class SamplingBatchInfo:
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
 
+        if self.return_sampling_masks is not None:
+            self.return_sampling_masks = [
+                self.return_sampling_masks[i] for i in keep_indices
+            ]
+            if not any(self.return_sampling_masks):
+                self.return_sampling_masks = None
+
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
     def _filter_batch_custom_logit_processor(
@@ -353,6 +366,8 @@ class SamplingBatchInfo:
         return merged_dict
 
     def merge_batch(self, other: "SamplingBatchInfo"):
+        self_batch_size = len(self)
+        other_batch_size = len(other)
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         # Merge the custom logit processors and custom params lists
@@ -362,8 +377,8 @@ class SamplingBatchInfo:
                 SamplingBatchInfo.merge_custom_logit_processor(
                     self.custom_logit_processor,
                     other.custom_logit_processor,
-                    len(self),
-                    len(other),
+                    self_batch_size,
+                    other_batch_size,
                     self.device,
                 )
             )
@@ -378,8 +393,21 @@ class SamplingBatchInfo:
         # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
         # See note below on len(self) and len(other).
         self.logit_bias = merge_bias_tensor(
-            self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
+            self.logit_bias,
+            other.logit_bias,
+            self_batch_size,
+            other_batch_size,
+            self.device,
+            0.0,
         )
+
+        if (
+            self.return_sampling_masks is not None
+            or other.return_sampling_masks is not None
+        ):
+            self.return_sampling_masks = (
+                self.return_sampling_masks or [False] * self_batch_size
+            ) + (other.return_sampling_masks or [False] * other_batch_size)
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before

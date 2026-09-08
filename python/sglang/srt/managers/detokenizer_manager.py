@@ -362,6 +362,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             load=recv_obj.load,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
+            output_token_sampling_mask=recv_obj.output_token_sampling_mask,
+            output_token_sampling_logprobs=recv_obj.output_token_sampling_logprobs,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
