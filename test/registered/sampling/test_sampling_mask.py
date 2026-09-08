@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers import sampler as sampler_module
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -100,6 +101,51 @@ class TestSamplingMask(unittest.TestCase):
             with self.subTest(name=name):
                 self._assert_sampler_case(
                     "pytorch", probs, top_k, top_p, min_p, support
+                )
+
+    def test_flashinfer_sampler_correctness(self):
+        tie_probs = [0.4, 0.2, 0.2, 0.1, 0.1]
+
+        with (
+            patch.object(
+                sampler_module,
+                "top_k_renorm_prob",
+                wraps=sampler_module.top_k_renorm_prob,
+            ) as top_k_renorm,
+            patch.object(
+                sampler_module,
+                "top_p_renorm_prob",
+                wraps=sampler_module.top_p_renorm_prob,
+            ) as top_p_renorm,
+        ):
+            self._run_sampler("flashinfer", tie_probs, 2, 0.45, 0.0, False)
+        top_k_renorm.assert_not_called()
+        top_p_renorm.assert_not_called()
+
+        with patch.object(
+            sampler_module,
+            "top_k_renorm_prob",
+            wraps=sampler_module.top_k_renorm_prob,
+        ) as top_k_renorm:
+            self._assert_sampler_case(
+                "flashinfer",
+                [0.4, 0.3, 0.2, 0.1],
+                TOP_K_ALL,
+                0.6,
+                0.0,
+                {0, 1},
+            )
+        top_k_renorm.assert_not_called()
+
+        cases = [
+            ("cutoff_tie", tie_probs, 2, 0.45, 0.0, {0, 1, 2}),
+            ("min_p", [0.4, 0.3, 0.2, 0.1], TOP_K_ALL, 1.0, 0.6, {0, 1}),
+            ("greedy", [0.4, 0.3, 0.2, 0.1], 1, 1.0, 0.0, {0}),
+        ]
+        for name, probs, top_k, top_p, min_p, support in cases:
+            with self.subTest(name=name):
+                self._assert_sampler_case(
+                    "flashinfer", probs, top_k, top_p, min_p, support
                 )
 
 

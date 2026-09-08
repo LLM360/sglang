@@ -250,6 +250,17 @@ class Sampler(nn.Module):
                     batch_next_token_ids = min_p_sampling_from_probs(
                         probs, sampling_info.min_ps
                     )
+                    if capture_rows is not None:
+                        capture_probs = probs.index_select(0, capture_rows)
+                        capture_min_ps = sampling_info.min_ps.index_select(
+                            0, capture_rows
+                        )
+                        filtered_probs = capture_probs.masked_fill(
+                            capture_probs
+                            < capture_probs.max(dim=-1).values.view(-1, 1)
+                            * capture_min_ps.view(-1, 1),
+                            0,
+                        )
                 else:
                     batch_next_token_ids = top_k_top_p_sampling_from_probs(
                         probs.contiguous(),
@@ -257,6 +268,48 @@ class Sampler(nn.Module):
                         sampling_info.top_ps,
                         filter_apply_order="joint",
                         check_nan=self.use_nan_detection,
+                    )
+                    if capture_rows is not None:
+                        capture_probs = probs.index_select(0, capture_rows)
+                        capture_top_ks = sampling_info.top_ks.index_select(
+                            0, capture_rows
+                        )
+                        capture_top_ps = sampling_info.top_ps.index_select(
+                            0, capture_rows
+                        )
+                        filtered_probs = capture_probs.clone()
+
+                        active_top_k = capture_top_ks != TOP_K_ALL
+                        if torch.any(active_top_k):
+                            top_k_support = (
+                                top_k_renorm_prob(
+                                    capture_probs[active_top_k],
+                                    capture_top_ks[active_top_k],
+                                )
+                                > 0
+                            )
+                            filtered_probs[active_top_k] = filtered_probs[
+                                active_top_k
+                            ].masked_fill(~top_k_support, 0)
+
+                        active_top_p = capture_top_ps < 1.0
+                        if torch.any(active_top_p):
+                            top_p_support = (
+                                top_p_renorm_prob(
+                                    capture_probs[active_top_p],
+                                    capture_top_ps[active_top_p],
+                                )
+                                > 0
+                            )
+                            filtered_probs[active_top_p] = filtered_probs[
+                                active_top_p
+                            ].masked_fill(~top_p_support, 0)
+
+                if capture_rows is not None:
+                    sampling_mask_capture = _SamplingMaskCapture(
+                        weights=filtered_probs,
+                        token_ids=None,
+                        batch_rows=capture_rows,
                     )
             elif backend == "pytorch":
                 # A slower fallback implementation with torch native operations.
