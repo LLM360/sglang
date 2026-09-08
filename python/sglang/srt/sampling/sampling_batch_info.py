@@ -63,6 +63,8 @@ class SamplingBatchInfo:
 
     # Used for deterministic sampling
     sampling_seed: Optional[torch.Tensor] = None
+    
+    return_sampling_masks: Optional[List[bool]] = None
 
     # Device
     device: str = "cuda"
