@@ -201,6 +201,7 @@ from sglang.srt.observability.scheduler_metrics_mixin import (
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -1723,6 +1724,31 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _get_sampling_mask_error(self, req: Req) -> Optional[str]:
+        if (
+            req.sampling_params.top_p == 1.0
+            and req.sampling_params.top_k == TOP_K_ALL
+            and req.sampling_params.min_p == 0.0
+        ):
+            return (
+                "return_sampling_mask requires an active top-k, top-p, or min-p filter."
+            )
+        if self.pp_size > 1:
+            return "return_sampling_mask is not supported with pipeline parallelism."
+        if not self.spec_algorithm.is_none():
+            return "return_sampling_mask is not supported with speculative decoding."
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            return "return_sampling_mask is not supported with disaggregation."
+        if not self.is_generation:
+            return "return_sampling_mask is only supported for generation."
+        if self.dllm_config is not None:
+            return "return_sampling_mask is not supported with DLLM."
+        if use_mlx():
+            return "return_sampling_mask is not supported with MLX."
+        if self.server_args.sampling_backend == "ascend":
+            return "return_sampling_mask is not supported with the Ascend sampling backend."
+        return None
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1776,6 +1802,7 @@ class Scheduler(
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
+                return_sampling_mask=recv_req.return_sampling_mask,
             )
             req.tokenizer = self.tokenizer
 
@@ -1822,6 +1849,8 @@ class Scheduler(
                 recv_req.input_ids,
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
+                http_worker_ipc=recv_req.http_worker_ipc,
+                return_sampling_mask=recv_req.return_sampling_mask,
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(
@@ -1830,6 +1859,20 @@ class Scheduler(
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
+
+        if req.return_sampling_mask:
+            sampling_mask_error = self._get_sampling_mask_error(req)
+            if sampling_mask_error is not None:
+                finish_reason = FINISH_ABORT(
+                    sampling_mask_error, HTTPStatus.BAD_REQUEST, "BadRequestError"
+                )
+                self.send_to_tokenizer.send_output(
+                    AbortReq(finished_reason=finish_reason.to_json(), rid=req.rid), req
+                )
+                req.time_stats.trace_ctx.abort(
+                    abort_info={"reason": sampling_mask_error}
+                )
+                return
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -3470,17 +3513,17 @@ class SenderWrapper:
     def send_output(
         self,
         output: Union[BaseReq, BaseBatchReq],
-        recv_obj: Optional[Union[BaseReq, BaseBatchReq]] = None,
+        recv_obj: Optional[Union[BaseReq, BaseBatchReq, Req]] = None,
     ):
         if self.socket is None:
             return
 
         if (
-            isinstance(recv_obj, BaseReq)
+            isinstance(recv_obj, (BaseReq, Req))
             and recv_obj.http_worker_ipc is not None
             and output.http_worker_ipc is None
         ):
-            # handle communicator reqs for multi-http worker case
+            # handle communicator reqs for multi-http workers.
             output.http_worker_ipc = recv_obj.http_worker_ipc
 
         self.socket.send_pyobj(output)

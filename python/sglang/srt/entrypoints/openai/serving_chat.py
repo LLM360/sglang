@@ -242,6 +242,10 @@ class OpenAIServingChat(OpenAIServingBase):
         """Validate that the input is valid."""
         if not request.messages:
             return "Messages cannot be empty."
+        if request.return_sampling_mask and request.stream:
+            return "return_sampling_mask is not supported with streaming chat."
+        if request.return_sampling_mask and not request.return_meta_info:
+            return "return_sampling_mask requires return_meta_info=true."
 
         if (
             isinstance(request.tool_choice, str)
@@ -357,6 +361,7 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
             return_logprob=request.logprobs,
+            return_sampling_mask=request.return_sampling_mask,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
             stream=request.stream,

@@ -149,6 +149,12 @@ class ReqState:
     input_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
     output_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
     output_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
+    output_token_sampling_mask: List[List[int]] = dataclasses.field(
+        default_factory=list
+    )
+    output_token_sampling_logprobs: List[float] = dataclasses.field(
+        default_factory=list
+    )
     input_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
     input_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
     output_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
@@ -967,6 +973,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 obj.top_logprobs_num,
                 obj.token_ids_logprob,
                 obj.stream,
+                return_sampling_mask=obj.return_sampling_mask,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
                 bootstrap_host=obj.bootstrap_host,
@@ -1212,6 +1219,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                         finish_reason.get("type") == "abort"
                         and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
                     ):
+                        if state.obj.rid in self.rid_to_state:
+                            del self.rid_to_state[state.obj.rid]
+                            if self.server_args.enable_lora and state.obj.lora_path:
+                                await self.lora_registry.release(state.obj.lora_id)
                         if not is_stream:
                             raise ValueError(finish_reason["message"])
                         else:
@@ -1580,6 +1591,25 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     and not self.server_args.skip_tokenizer_init,
                     recv_obj,
                     i,
+                )
+
+            if getattr(state.obj, "return_sampling_mask", False):
+                assert recv_obj.output_token_sampling_mask is not None
+                assert recv_obj.output_token_sampling_logprobs is not None
+                state.output_token_sampling_mask.extend(
+                    recv_obj.output_token_sampling_mask[i]
+                )
+                state.output_token_sampling_logprobs.extend(
+                    recv_obj.output_token_sampling_logprobs[i]
+                )
+                meta_info["output_token_sampling_mask"] = (
+                    state.output_token_sampling_mask.copy()
+                )
+                meta_info["output_token_sampling_logprobs"] = (
+                    state.output_token_sampling_logprobs.copy()
+                )
+                meta_info["output_token_sampling_mask_length"] = len(
+                    state.output_token_sampling_mask
                 )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):

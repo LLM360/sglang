@@ -592,6 +592,7 @@ class ChatCompletionRequest(BaseModel):
     return_prompt_token_ids: bool = False
     return_completion_token_ids: bool = False
     return_meta_info: bool = False
+    return_sampling_mask: bool = False
     reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "

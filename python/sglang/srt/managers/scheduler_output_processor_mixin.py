@@ -120,6 +120,21 @@ class SchedulerOutputProcessorMixin:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def maybe_collect_sampling_mask(
+        self, i: int, req: Req, logits_output: LogitsProcessorOutput
+    ) -> None:
+        if not req.return_sampling_mask or req.is_prefill_only:
+            return
+        assert logits_output.next_token_sampling_mask_idx is not None
+        assert logits_output.next_token_sampling_logprobs is not None
+        mask = logits_output.next_token_sampling_mask_idx[i]
+        sampling_logprob = logits_output.next_token_sampling_logprobs[i]
+        assert mask is not None and sampling_logprob is not None
+        assert req.output_token_sampling_mask is not None
+        assert req.output_token_sampling_logprobs is not None
+        req.output_token_sampling_mask.append(mask)
+        req.output_token_sampling_logprobs.append(sampling_logprob)
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -182,6 +197,7 @@ class SchedulerOutputProcessorMixin:
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
+                    self.maybe_collect_sampling_mask(i, req, logits_output)
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -451,6 +467,7 @@ class SchedulerOutputProcessorMixin:
                 # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+            self.maybe_collect_sampling_mask(i, req, logits_output)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -953,6 +970,9 @@ class SchedulerOutputProcessorMixin:
         load = self.get_load()
         routed_experts = None
         customized_info = {}
+        return_sampling_mask = any(req.return_sampling_mask for req in reqs)
+        output_token_sampling_mask = [] if return_sampling_mask else None
+        output_token_sampling_logprobs = [] if return_sampling_mask else None
 
         time_stats = []
 
@@ -1031,6 +1051,25 @@ class SchedulerOutputProcessorMixin:
 
                 # Exclude the tokens after stop condition
                 output_ids_ = req.output_ids_through_stop
+
+                if return_sampling_mask:
+                    if req.return_sampling_mask:
+                        assert req.output_token_sampling_mask is not None
+                        assert req.output_token_sampling_logprobs is not None
+                        sampling_mask_end = len(output_ids_)
+                        output_token_sampling_mask.append(
+                            req.output_token_sampling_mask[
+                                send_token_offset:sampling_mask_end
+                            ]
+                        )
+                        output_token_sampling_logprobs.append(
+                            req.output_token_sampling_logprobs[
+                                send_token_offset:sampling_mask_end
+                            ]
+                        )
+                    else:
+                        output_token_sampling_mask.append([])
+                        output_token_sampling_logprobs.append([])
 
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
@@ -1199,6 +1238,8 @@ class SchedulerOutputProcessorMixin:
                     retraction_counts=retraction_counts,
                     load=load,
                     dp_ranks=dp_ranks,
+                    output_token_sampling_mask=output_token_sampling_mask,
+                    output_token_sampling_logprobs=output_token_sampling_logprobs,
                 )
             )
 

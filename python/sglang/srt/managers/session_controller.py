@@ -230,6 +230,7 @@ class Session:
             routing_key=req.routing_key,
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
+            return_sampling_mask=req.return_sampling_mask,
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
