@@ -20,9 +20,10 @@
 #   - No shared_expert_gate (shared expert output added directly)
 #   - Dense layers specified via mlp_only_layers config
 #   - Partial RoPE (rope_head_dim < head_dim)
-"""Inference-only Xllm K2MoE model compatible with HuggingFace weights."""
+"""Inference-only xLLM K2MoE and MoVA models compatible with HF weights."""
 
 import logging
+import math
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -51,8 +52,10 @@ from sglang.srt.layers.communicator import (
 try:
     from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
 except ImportError:
+
     def enable_moe_dense_fully_dp():
         return getattr(get_global_server_args(), "moe_dense_tp_size", -1) == 1
+
 
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -69,13 +72,22 @@ class XllmGroupRMSNorm(nn.Module):
     Matches the HF XllmRMSNorm implementation used by the xllm model family.
     """
 
-    def __init__(self, hidden_size: int, n_groups: int = 1, eps: float = 1e-6):
+    def __init__(
+        self,
+        hidden_size: int,
+        n_groups: int = 1,
+        eps: float = 1e-6,
+        zero_centered: bool = False,
+    ):
         super().__init__()
         self.n_groups = n_groups
         self.hidden_size = hidden_size
         assert hidden_size % n_groups == 0
         self.variance_epsilon = eps
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.zero_centered = zero_centered
+        self.weight = nn.Parameter(
+            torch.zeros(hidden_size) if zero_centered else torch.ones(hidden_size)
+        )
 
     def forward(self, hidden_states, residual=None, post_residual_addition=None):
         if residual is not None:
@@ -93,7 +105,8 @@ class XllmGroupRMSNorm(nn.Module):
             hidden_states.pow(2).mean(-1, keepdim=True) + self.variance_epsilon
         )
         hidden_states = hidden_states.reshape(*hidden_states.shape[:-2], -1)
-        hidden_states = (self.weight * hidden_states).to(orig_dtype)
+        weight = self.weight + 1.0 if self.zero_centered else self.weight
+        hidden_states = (weight * hidden_states).to(orig_dtype)
         if residual is not None:
             return hidden_states, residual
         return hidden_states
@@ -102,14 +115,19 @@ class XllmGroupRMSNorm(nn.Module):
 def _make_norm(config):
     """Create the appropriate RMSNorm for this config."""
     n_groups = getattr(config, "layernorm_num_groups", 1)
-    if n_groups is None or n_groups <= 1:
+    is_mova = getattr(config, "num_values", 0) > 0
+    if (n_groups is None or n_groups <= 1) and not is_mova:
         return RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
     return XllmGroupRMSNorm(
-        config.hidden_size, n_groups=n_groups, eps=config.rms_norm_eps
+        config.hidden_size,
+        n_groups=n_groups or 1,
+        eps=config.rms_norm_eps,
+        zero_centered=is_mova,
     )
 
 
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
@@ -120,6 +138,8 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.mova import RoutedValueExperts, mova_router_topk
+
 try:
     from sglang.srt.layers.moe.utils import RoutingMethodType
 except ImportError:
@@ -134,6 +154,7 @@ except ImportError:
         TopK = 5
         Unspecified = 6
 
+
 try:
     from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 except ImportError:
@@ -144,6 +165,8 @@ except ImportError:
             and x.data.ndim > 0
             and x.data.shape[0] == num_local_experts
         )
+
+
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -162,7 +185,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     make_layers,
-    use_intel_amx_backend,
+    set_weight_attrs,
 )
 
 logger = logging.getLogger(__name__)
@@ -170,6 +193,122 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
+
+
+def _validate_mova_config(
+    config: PretrainedConfig,
+    quant_config: Optional[QuantizationConfig],
+) -> None:
+    """Fail early for phase-one combinations that cannot be served exactly."""
+
+    if getattr(config, "num_values", 0) <= 0:
+        return
+    if torch.get_default_dtype() != torch.bfloat16:
+        raise ValueError(
+            "MoVA phase 1 requires --dtype bfloat16. The converted 36B HF "
+            "artifact reports float32, so SGLang dtype=auto would select fp16."
+        )
+    if quant_config is not None:
+        raise ValueError("MoVA phase 1 does not support quantized model weights")
+    if getattr(config, "attention_bias", False):
+        raise ValueError("MoVA phase 1 requires bias-free Q/K/V/O projections")
+    if getattr(config, "query_key_norm", False):
+        raise ValueError("MoVA phase 1 does not support query/key normalization")
+    if not getattr(config, "apply_attn_gate", False):
+        raise ValueError("MoVA phase 1 requires the xLLM attention gate")
+    head_dim = getattr(
+        config, "head_dim", config.hidden_size // config.num_attention_heads
+    )
+    if head_dim % 2:
+        raise ValueError(f"MoVA requires an even RoPE head dimension, got {head_dim}")
+    if config.num_attention_heads % config.num_key_value_heads:
+        raise ValueError("MoVA requires query heads to be divisible by KV heads")
+    if getattr(config, "rope_head_dim", head_dim) != head_dim:
+        raise ValueError("MoVA phase 1 requires full-head interleaved RoPE")
+    rope_scaling = getattr(config, "rope_scaling", None)
+    # Transformers 5 normalizes a JSON ``rope_scaling: null`` into an
+    # explicit default-RoPE dictionary.  That representation does not change
+    # the rotary math and must not be confused with linear/dynamic scaling.
+    if rope_scaling is not None and not (
+        isinstance(rope_scaling, dict)
+        and rope_scaling.get("rope_type", rope_scaling.get("type")) == "default"
+    ):
+        raise ValueError("MoVA phase 1 does not support non-default RoPE scaling")
+    if getattr(config, "sliding_window", None) is not None or getattr(
+        config, "use_sliding_window", False
+    ):
+        raise ValueError("MoVA phase 1 uses full causal RadixAttention only")
+    if getattr(config, "attn_gate_func", "silu") not in ("silu", "softplus"):
+        raise ValueError("MoVA supports only silu and softplus attention gates")
+    if getattr(config, "router_score_func", "sigmoid") not in ("sigmoid", "softmax"):
+        raise ValueError("MoVA supports only sigmoid and softmax value routing")
+    router_scale = getattr(config, "router_scaling_factor", 1.0)
+    if router_scale is None or not math.isfinite(router_scale) or router_scale <= 0:
+        raise ValueError(
+            f"MoVA requires a positive finite router scaling factor, got {router_scale}"
+        )
+    num_dense_layers = getattr(config, "num_dense_layers", None)
+    if (
+        num_dense_layers is None
+        or not 0 <= num_dense_layers <= config.num_hidden_layers
+    ):
+        raise ValueError(
+            "MoVA requires num_dense_layers in [0, num_hidden_layers], got "
+            f"{num_dense_layers}"
+        )
+    expected_dense_layers = list(range(num_dense_layers))
+    if list(getattr(config, "mlp_only_layers", [])) != expected_dense_layers:
+        raise ValueError(
+            "MoVA phase 1 requires dense attention and dense FFN prefix layers to "
+            f"match exactly; expected mlp_only_layers={expected_dense_layers}"
+        )
+    if getattr(config, "decoder_sparse_step", 1) != 1:
+        raise ValueError("MoVA phase 1 requires decoder_sparse_step=1")
+    num_values = config.num_values
+    top_k = getattr(config, "num_values_per_tok", 0)
+    if not 0 < top_k <= num_values:
+        raise ValueError(
+            f"num_values_per_tok must be in [1, {num_values}], got {top_k}"
+        )
+    if getattr(config, "num_experts", 0) <= 0:
+        raise ValueError("MoVA requires sparse MoE feed-forward layers")
+    n_groups = getattr(config, "layernorm_num_groups", 1) or 1
+    if config.hidden_size % n_groups:
+        raise ValueError(
+            f"hidden size {config.hidden_size} is not divisible by {n_groups} norm groups"
+        )
+    attn_tp_size = get_attention_tp_size()
+    if config.num_attention_heads % attn_tp_size:
+        raise ValueError(f"MoVA query heads must be divisible by TP={attn_tp_size}")
+    if config.num_key_value_heads % attn_tp_size:
+        raise ValueError(
+            "MoVA phase 1 requires TP <= KV heads and KV heads divisible by TP; "
+            f"got TP={attn_tp_size}, KV heads={config.num_key_value_heads}"
+        )
+
+
+def _xllm_stacked_params_mapping(config: PretrainedConfig):
+    if getattr(config, "num_values", 0) <= 0:
+        return [
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+
+    mapping = [
+        (".qkg_proj", ".q_proj", "q"),
+        (".qkg_proj", ".attn_gate_proj", "gate"),
+        (".qkg_proj", ".k_proj", "k"),
+        (".gate_up_proj", ".gate_proj", 0),
+        (".gate_up_proj", ".up_proj", 1),
+    ]
+    mapping.extend(
+        (".v_experts.weight", f".v_experts.{expert_id}.weight", expert_id)
+        for expert_id in range(config.num_values)
+    )
+    return mapping
 
 
 def permute_to_xllm(x):
@@ -180,6 +319,149 @@ def permute_to_xllm(x):
 def permute_to_hf(x):
     """Inverse of permute_to_xllm: [0,64,1,65,...,63,127] -> [0,1,...,63,64,...,127]"""
     return x.reshape(*x.shape[:-1], -1, 2).transpose(-1, -2).reshape(*x.shape[:-1], -1)
+
+
+def _interleave_rope_weight(weight: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """Convert HF/NeoX Q or K rows to native interleaved RoPE order."""
+
+    if weight.shape[0] % num_heads:
+        raise ValueError(
+            f"Projection width {weight.shape[0]} is not divisible by {num_heads} heads"
+        )
+    head_dim = weight.shape[0] // num_heads
+    if head_dim % 2:
+        raise ValueError(f"RoPE head dimension must be even, got {head_dim}")
+    rows = weight.reshape(num_heads, head_dim, weight.shape[1])
+    rows = rows.reshape(num_heads, 2, head_dim // 2, weight.shape[1])
+    return rows.transpose(1, 2).reshape_as(weight).contiguous()
+
+
+class XllmQKGParallelLinear(nn.Module):
+    """One TP-sharded Q/K/gate projection packed by local GQA group.
+
+    The persistent layout matches Megatron's ``linear_qkg`` contract:
+    ``[Q heads in group, gate heads in group, K head]`` for every KV group.
+    Canonical HF Q/K tensors are converted to interleaved RoPE row order while
+    loading, removing a permutation from every forward pass.
+    """
+
+    _SHARD_IDS = {"q", "gate", "k"}
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        *,
+        tp_rank: int,
+        tp_size: int,
+    ) -> None:
+        super().__init__()
+        if num_heads % num_kv_heads:
+            raise ValueError(
+                f"Query heads {num_heads} must be divisible by KV heads {num_kv_heads}"
+            )
+        if num_kv_heads % tp_size:
+            raise ValueError(
+                "MoVA requires attention TP to divide the number of KV heads; "
+                f"got TP={tp_size}, KV heads={num_kv_heads}"
+            )
+        self.hidden_size = hidden_size
+        self.total_num_heads = num_heads
+        self.total_num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.num_kv_heads = num_kv_heads // tp_size
+        self.queries_per_kv = num_heads // num_kv_heads
+        self.group_width = 2 * self.queries_per_kv + 1
+        self.weight = nn.Parameter(
+            torch.empty(
+                self.num_kv_heads * self.group_width * head_dim,
+                hidden_size,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.weight, {"weight_loader": self.weight_loader})
+
+    @property
+    def q_size(self) -> int:
+        return self.num_kv_heads * self.queries_per_kv * self.head_dim
+
+    @property
+    def kv_size(self) -> int:
+        return self.num_kv_heads * self.head_dim
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str,
+    ) -> None:
+        if loaded_shard_id not in self._SHARD_IDS:
+            raise ValueError(f"Invalid QKG shard id: {loaded_shard_id}")
+        param_data = param.data.view(
+            self.num_kv_heads,
+            self.group_width,
+            self.head_dim,
+            self.hidden_size,
+        )
+        kv_begin = self.tp_rank * self.num_kv_heads
+
+        if loaded_shard_id in ("q", "gate"):
+            expected_heads = self.total_num_heads
+            expected = (expected_heads * self.head_dim, self.hidden_size)
+            if tuple(loaded_weight.shape) != expected:
+                raise ValueError(
+                    f"{loaded_shard_id} projection must be {expected}, got "
+                    f"{tuple(loaded_weight.shape)}"
+                )
+            if loaded_shard_id == "q":
+                loaded_weight = _interleave_rope_weight(
+                    loaded_weight, self.total_num_heads
+                )
+            local = loaded_weight.view(
+                self.total_num_kv_heads,
+                self.queries_per_kv,
+                self.head_dim,
+                self.hidden_size,
+            ).narrow(0, kv_begin, self.num_kv_heads)
+            offset = 0 if loaded_shard_id == "q" else self.queries_per_kv
+            param_data[:, offset : offset + self.queries_per_kv].copy_(local)
+            return
+
+        expected = (self.total_num_kv_heads * self.head_dim, self.hidden_size)
+        if tuple(loaded_weight.shape) != expected:
+            raise ValueError(
+                f"k projection must be {expected}, got {tuple(loaded_weight.shape)}"
+            )
+        loaded_weight = _interleave_rope_weight(loaded_weight, self.total_num_kv_heads)
+        local = loaded_weight.view(
+            self.total_num_kv_heads, 1, self.head_dim, self.hidden_size
+        ).narrow(0, kv_begin, self.num_kv_heads)
+        param_data[:, -1:].copy_(local)
+
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qkg = F.linear(hidden_states, self.weight)
+        qkg = qkg.view(
+            hidden_states.shape[0],
+            self.num_kv_heads,
+            self.group_width,
+            self.head_dim,
+        )
+        q = qkg[:, :, : self.queries_per_kv].reshape(
+            hidden_states.shape[0], self.q_size
+        )
+        gate = qkg[
+            :,
+            :,
+            self.queries_per_kv : 2 * self.queries_per_kv,
+        ].reshape(hidden_states.shape[0], self.q_size)
+        k = qkg[:, :, -1].reshape(hidden_states.shape[0], self.kv_size)
+        return q, k, gate
 
 
 class XllmMLP(nn.Module):
@@ -549,9 +831,7 @@ class XllmAttention(nn.Module):
         k_rope_flat = permute_to_hf(k_rope).reshape(
             -1, self.num_kv_heads * self.rope_head_dim
         )
-        q_rope_flat, k_rope_flat = self.rotary_emb(
-            positions, q_rope_flat, k_rope_flat
-        )
+        q_rope_flat, k_rope_flat = self.rotary_emb(positions, q_rope_flat, k_rope_flat)
 
         q_rope = permute_to_xllm(
             q_rope_flat.reshape(-1, self.num_heads, self.rope_head_dim)
@@ -587,6 +867,193 @@ class XllmAttention(nn.Module):
         return output
 
 
+class _XllmMoVAAttentionBase(nn.Module):
+    """Shared gated-GQA path for dense and routed-value MoVA layers."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        if quant_config is not None:
+            raise ValueError("MoVA phase 1 supports unquantized bf16/fp16 weights only")
+
+        self.hidden_size = config.hidden_size
+        self.total_num_heads = config.num_attention_heads
+        self.total_num_kv_heads = config.num_key_value_heads
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.rope_head_dim = getattr(config, "rope_head_dim", self.head_dim)
+        self.apply_attn_gate = getattr(config, "apply_attn_gate", False)
+        self.attn_gate_func = getattr(config, "attn_gate_func", "silu")
+        self.scaling = self.head_dim**-0.5
+
+        self.tp_rank = get_attention_tp_rank()
+        self.tp_size = get_attention_tp_size()
+        if self.total_num_heads % self.tp_size:
+            raise ValueError(
+                f"Attention heads {self.total_num_heads} are not divisible by TP={self.tp_size}"
+            )
+        if self.total_num_kv_heads % self.tp_size:
+            raise ValueError(
+                "MoVA phase 1 requires TP <= KV heads and KV heads divisible by TP; "
+                f"got TP={self.tp_size}, KV heads={self.total_num_kv_heads}"
+            )
+        self.num_heads = self.total_num_heads // self.tp_size
+        self.num_kv_heads = self.total_num_kv_heads // self.tp_size
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+
+        self.qkg_proj = XllmQKGParallelLinear(
+            config.hidden_size,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            self.head_dim,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            config.hidden_size,
+            bias=False,
+            quant_config=None,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            reduce_results=False,
+            prefix=add_prefix("o_proj", prefix),
+        )
+        # HF Q/K rows are converted to this interleaved convention by the QKG
+        # loader, so no per-token permutation is needed here.
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.rope_head_dim,
+            max_position=getattr(config, "max_position_embeddings", 8192),
+            base=getattr(config, "rope_theta", 10000),
+            rope_scaling=getattr(config, "rope_scaling", None),
+            is_neox_style=False,
+        )
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
+            quant_config=None,
+            prefix=add_prefix("attn", prefix),
+        )
+
+    def _project_value(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _activate_gate(self, gate: torch.Tensor) -> torch.Tensor:
+        if self.attn_gate_func == "silu":
+            return F.silu(gate)
+        if self.attn_gate_func == "softplus":
+            return F.softplus(gate, beta=math.log(2))
+        raise ValueError(
+            f"Unsupported xLLM attention gate function: {self.attn_gate_func}"
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        q, k, gate = self.qkg_proj(hidden_states)
+        value = self._project_value(hidden_states)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, value, forward_batch)
+        if self.apply_attn_gate:
+            attn_output = attn_output * self._activate_gate(gate)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+
+class XllmGatedAttention(_XllmMoVAAttentionBase):
+    """Dense GQA used by the prefix layers of a MoVA checkpoint."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config, layer_id, quant_config, prefix)
+        self.v_proj = ColumnParallelLinear(
+            config.hidden_size,
+            self.total_num_kv_heads * self.head_dim,
+            bias=False,
+            quant_config=None,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            prefix=add_prefix("v_proj", prefix),
+        )
+
+    def _project_value(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        value, _ = self.v_proj(hidden_states)
+        return value
+
+
+class XllmMoVAAttention(_XllmMoVAAttentionBase):
+    """Sparse MoVA attention with output-sharded routed value experts."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config, layer_id, quant_config, prefix)
+        self.num_values = config.num_values
+        self.num_values_per_tok = config.num_values_per_tok
+        self.router_score_func = getattr(config, "router_score_func", "sigmoid")
+        self.router_scaling_factor = getattr(config, "router_scaling_factor", 1.0)
+        self.renormalize = getattr(config, "norm_topk_prob", True)
+        self.v_router = ReplicatedLinear(
+            config.hidden_size,
+            self.num_values,
+            bias=False,
+            quant_config=None,
+            prefix=add_prefix("v_router", prefix),
+        )
+        if getattr(config, "moe_gate_bias", False):
+            # SGLang's fused sigmoid top-k requires correction bias in fp32.
+            # It remains a loadable parameter for Miles weight updates, but is
+            # never included in the router logits matmul.
+            self.v_router.bias = nn.Parameter(
+                torch.empty(self.num_values, dtype=torch.float32),
+                requires_grad=False,
+            )
+        self.v_experts = RoutedValueExperts(
+            self.num_values,
+            config.hidden_size,
+            self.total_num_kv_heads * self.head_dim,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+        )
+
+    def _project_value(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Router bias is deliberately omitted from the logits matmul. It only
+        # changes route selection inside ``mova_router_topk``.
+        router_logits = F.linear(hidden_states, self.v_router.weight)
+        routing_weights, selected_values = mova_router_topk(
+            router_logits,
+            self.v_router.bias,
+            score_func=self.router_score_func,
+            top_k=self.num_values_per_tok,
+            scaling_factor=self.router_scaling_factor,
+            renormalize=self.renormalize,
+        )
+        return self.v_experts(hidden_states, routing_weights, selected_values)
+
+
 class XllmDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -603,23 +1070,10 @@ class XllmDecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         qkv_bias = getattr(config, "attention_bias", False)
-        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        rope_head_dim = getattr(config, "rope_head_dim", head_dim)
-
-        self.self_attn = XllmAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=head_dim,
-            rope_head_dim=rope_head_dim,
-            layer_id=layer_id,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            qkv_bias=qkv_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
         )
+        rope_head_dim = getattr(config, "rope_head_dim", head_dim)
 
         self.layer_id = layer_id
 
@@ -630,20 +1084,50 @@ class XllmDecoderLayer(nn.Module):
         mlp_only_layers = getattr(config, "mlp_only_layers", [])
         decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
         if (layer_id not in mlp_only_layers) and (
-            config.num_experts > 0
-            and (layer_id + 1) % decoder_sparse_step == 0
+            config.num_experts > 0 and (layer_id + 1) % decoder_sparse_step == 0
         ):
             self.is_layer_sparse = True
         else:
             self.is_layer_sparse = False
+
+        is_mova_config = getattr(config, "num_values", 0) > 0
+        is_mova_attention = is_mova_config and layer_id >= config.num_dense_layers
+        if is_mova_attention:
+            self.self_attn = XllmMoVAAttention(
+                config=config,
+                layer_id=layer_id,
+                quant_config=quant_config,
+                prefix=add_prefix("self_attn", prefix),
+            )
+        elif is_mova_config:
+            self.self_attn = XllmGatedAttention(
+                config=config,
+                layer_id=layer_id,
+                quant_config=quant_config,
+                prefix=add_prefix("self_attn", prefix),
+            )
+        else:
+            self.self_attn = XllmAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                head_dim=head_dim,
+                rope_head_dim=rope_head_dim,
+                layer_id=layer_id,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                qkv_bias=qkv_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("self_attn", prefix),
+            )
 
         # Check neighbors for scatter modes
         def _is_sparse(lid):
             if lid < 0 or lid >= config.num_hidden_layers:
                 return False
             return (lid not in mlp_only_layers) and (
-                config.num_experts > 0
-                and (lid + 1) % decoder_sparse_step == 0
+                config.num_experts > 0 and (lid + 1) % decoder_sparse_step == 0
             )
 
         is_previous_layer_sparse = _is_sparse(layer_id - 1)
@@ -726,7 +1210,9 @@ class XllmDecoderLayer(nn.Module):
         )
 
         if isinstance(self.mlp, XllmMLP):
-            hidden_states = self.mlp(hidden_states, use_reduce_scatter=use_reduce_scatter)
+            hidden_states = self.mlp(
+                hidden_states, use_reduce_scatter=use_reduce_scatter
+            )
         else:
             hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
 
@@ -821,7 +1307,8 @@ class XllmModel(nn.Module):
             for i in range(self.start_layer, self.end_layer):
                 _server_args = get_global_server_args()
                 _disable_pcg = getattr(
-                    _server_args, "disable_piecewise_cuda_graph",
+                    _server_args,
+                    "disable_piecewise_cuda_graph",
                     not getattr(_server_args, "enable_piecewise_cuda_graph", True),
                 )
                 ctx = (
@@ -875,6 +1362,7 @@ class XllmForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        _validate_mova_config(config, quant_config)
         # Keep the 375B MoE path single-stream. CUDA graph capture is still
         # allowed, but the capture-mode dual-stream path adds async
         # shared-expert/router risk without being required for correctness.
@@ -894,6 +1382,17 @@ class XllmForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+
+        # Value experts are shards of one attention-TP parameter, not FFN/EP
+        # experts. ParameterMapper therefore stages all 64 canonical HF shards
+        # before writing the persistent packed tensor during live updates.
+        self.stacked_params_mapping = _xllm_stacked_params_mapping(config)
+        self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
 
     @torch.no_grad()
     def forward(
@@ -920,7 +1419,10 @@ class XllmForCausalLM(nn.Module):
             )
             if logits_output.next_token_logits is not None:
                 logits_output.next_token_logits = torch.nan_to_num(
-                    logits_output.next_token_logits, nan=0.0, posinf=65504.0, neginf=-65504.0
+                    logits_output.next_token_logits,
+                    nan=0.0,
+                    posinf=65504.0,
+                    neginf=-65504.0,
                 )
             return logits_output
         else:
@@ -935,21 +1437,8 @@ class XllmForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
+        stacked_params_mapping = self.stacked_params_mapping
+        expert_params_mapping = self.expert_params_mapping
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
