@@ -24,7 +24,9 @@ import pytest
 import torch
 from k2_fp8_native_utils import native_cpu_context
 
+from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.k2_horizon import K2HorizonConfig
+from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
@@ -33,7 +35,8 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
 )
-from sglang.srt.model_loader.loader import _post_load_weights
+from sglang.srt.model_loader import loader as model_loader
+from sglang.srt.model_loader.loader import PreshardedModelLoader, _post_load_weights
 from sglang.srt.models import xllm
 from sglang.srt.models.xllm import K2HorizonForCausalLM
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -350,7 +353,123 @@ def test_dense_native_tied_pp_ownership(monkeypatch, rank):
         _assert_dense_expected(model, expected)
 
 
+def _prepare_presharded_restore(monkeypatch, tmp_path, model, weights, fault=None):
+    load_config = LoadConfig(
+        load_format="presharded",
+        model_loader_extra_config={
+            "presharded_path": str(tmp_path),
+            "verify_on_load": True,
+            "hash_num_threads": 1,
+        },
+    )
+    loader = PreshardedModelLoader(load_config)
+    config = SimpleNamespace(
+        model_path=str(tmp_path),
+        is_draft_model=False,
+        dtype=next(model.parameters()).dtype,
+    )
+    shard_config = {"tp": 1}
+    monkeypatch.setattr(loader, "_collect_shard_config", lambda config: shard_config)
+    monkeypatch.setattr(model_loader, "_get_quantization_config", lambda *args: None)
+    monkeypatch.setattr(model_loader, "_initialize_model", lambda *args: model)
+    folder = Path(loader._presharded_dir(config, shard_config))
+    folder.mkdir()
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    weights = dict(weights)
+    if fault == "missing":
+        del weights["model.norm.weight"]
+    manifest = {
+        name: {
+            "checksum": loader._hash_tensor(tensor),
+            "size": tensor.numel() * tensor.element_size(),
+            "dtype": str(tensor.dtype),
+            "shape": list(tensor.shape),
+        }
+        for name, tensor in weights.items()
+    }
+    (manifests / "manifest_00000.json").write_text(json.dumps(manifest))
+    plan = loader._build_dump_plan(
+        world_size=1, tmp_dir=str(manifests), max_file_bytes=1 << 30
+    )
+    plan["shard_config"] = shard_config
+    if fault == "checksum":
+        checksum = int(plan["rank_checksums"]["0"], 16) ^ 1
+        plan["rank_checksums"]["0"] = f"{checksum:016x}"
+    loader._dump_files_for_rank(weights, plan, 0, str(folder))
+    (folder / loader.CHECKSUM_FILENAME).write_text(json.dumps(plan))
+    (folder / loader.READY_FILENAME).write_text("{}")
+    return loader, config
+
+
+def _reject_post_load_transform():
+    raise AssertionError("A restored native tensor must not be processed again")
+
+
+def test_dense_native_presharded_update(monkeypatch, tmp_path):
+    with native_cpu_context(monkeypatch):
+        model, tensors = _model_and_tensors("7b")
+        expected = _expected_storage(model.config, tensors, tp=1, rank=0)
+        weights = {
+            name: expected[name].to(parameter.dtype)
+            for name, parameter in model.named_parameters()
+        }
+        monkeypatch.setattr(model, "post_load_weights", _reject_post_load_transform)
+        loader, config = _prepare_presharded_restore(
+            monkeypatch, tmp_path, model, weights
+        )
+        restored = loader.load_model(
+            model_config=config, device_config=DeviceConfig("cpu")
+        )
+        assert restored is model
+        assert model.training is False
+        _assert_dense_expected(model, expected)
+        name = "model.layers.0.mlp.up_proj.weight_scale"
+        tensors[name] = torch.full_like(tensors[name], 2)
+        expected = _expected_storage(model.config, tensors, tp=1, rank=0)
+        model.load_weights([(name, tensors[name])])
+        _assert_dense_expected(model, expected)
+
+
+@pytest.mark.parametrize("fault", ("missing", "checksum"))
+def test_dense_native_presharded_failure_stays_pending(monkeypatch, tmp_path, fault):
+    with native_cpu_context(monkeypatch):
+        model, tensors = _model_and_tensors("7b")
+        expected = _expected_storage(model.config, tensors, tp=1, rank=0)
+        weights = {
+            name: expected[name].to(parameter.dtype)
+            for name, parameter in model.named_parameters()
+        }
+        loader, config = _prepare_presharded_restore(
+            monkeypatch, tmp_path, model, weights, fault
+        )
+        message = "Missing keys" if fault == "missing" else "checksum mismatch"
+        with pytest.raises(ValueError, match=message):
+            loader.load_model(model_config=config, device_config=DeviceConfig("cpu"))
+        name = "model.layers.0.self_attn.q_proj.weight"
+        with pytest.raises(ValueError, match="Dense K2 FP8 initial load is missing"):
+            model.load_weights([(name, tensors[name])])
+
+
+def test_dense_native_presharded_does_not_repeat_transforms(monkeypatch, tmp_path):
+    model = torch.nn.Linear(2, 2, bias=False, dtype=torch.float32)
+    parameter = model.weight
+    expected = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    monkeypatch.setattr(
+        model, "post_load_weights", _reject_post_load_transform, raising=False
+    )
+    loader, config = _prepare_presharded_restore(
+        monkeypatch, tmp_path, model, {"weight": expected}
+    )
+    restored = loader.load_model(model_config=config, device_config=DeviceConfig("cpu"))
+    assert restored is model
+    assert model.weight is parameter
+    assert model.training is False
+    torch.testing.assert_close(model.weight, expected, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     import sys
 
-    sys.exit(pytest.main([__file__, "-v"]))
+    args = [arg for arg in sys.argv[1:] if arg != "-f"]
+    sys.exit(pytest.main([__file__, "-v", *args]))
