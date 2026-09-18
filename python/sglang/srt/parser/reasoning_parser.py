@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple, Type
+from typing import Any, Dict, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.harmony_parser import HarmonyParser
@@ -51,6 +51,15 @@ class BaseReasoningFormatDetector:
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
 
+    def _on_tool_start_token_fallback(
+        self,
+        *,
+        tool_idx: int,
+        reasoning_text: str,
+        normal_text: str,
+    ) -> None:
+        pass
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses reasoning sections in the provided text.
@@ -79,6 +88,11 @@ class BaseReasoningFormatDetector:
                 reasoning_text = processed_text[:tool_idx]
                 # Preserve tool_start_token in normal text
                 normal_text = processed_text[tool_idx:]
+                self._on_tool_start_token_fallback(
+                    tool_idx=tool_idx,
+                    reasoning_text=reasoning_text,
+                    normal_text=normal_text,
+                )
                 return StreamingParseResult(
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
@@ -536,6 +550,80 @@ class K2V3Detector(BaseReasoningFormatDetector):
             previous_content=previous_content,
         )
 
+class K2V3DetectorTracking(K2V3Detector):
+    """K2-v3 reasoning parser variant that records selected fallback events.
+
+    This keeps fallback instrumentation opt-in. The default ``k2_v3`` parser
+    remains behaviorally unchanged, while ``k2_v3_tracking`` records when the
+    parser recovers from a missing think-end token by splitting at the IFM tool
+    start token.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        reasoning_effort: str = "high",
+    ):
+        self.fallback_events: list[dict[str, Any]] = []
+        self._suppress_fallback_tracking = False
+        super().__init__(
+            stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            reasoning_effort=reasoning_effort,
+        )
+
+    def clear_fallback_events(self) -> None:
+        self.fallback_events.clear()
+
+    def _record_fallback(
+        self, fallback_type: str, phase: str, **details: Any
+    ) -> None:
+        if self._suppress_fallback_tracking:
+            return
+        self.fallback_events.append(
+            {"type": fallback_type, "phase": phase, "details": details}
+        )
+
+    @staticmethod
+    def _preview_value(value: str, limit: int = 120) -> str:
+        if len(value) > limit:
+            return value[: limit - 3] + "..."
+        return value
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        self.clear_fallback_events()
+        return super().detect_and_parse(text)
+
+    def _on_tool_start_token_fallback(
+        self,
+        *,
+        tool_idx: int,
+        reasoning_text: str,
+        normal_text: str,
+    ) -> None:
+        self._record_fallback(
+            "tool_start_token_fallback",
+            "non_stream",
+            think_end_token=self.think_end_token,
+            tool_start_token=self.tool_start_token,
+            tool_start_index=tool_idx,
+            reasoning_preview=self._preview_value(reasoning_text),
+            normal_text_preview=self._preview_value(normal_text),
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        previous = self._suppress_fallback_tracking
+        self._suppress_fallback_tracking = True
+        try:
+            return super().parse_streaming_increment(new_text)
+        finally:
+            self._suppress_fallback_tracking = previous
+
 
 class K2V3DetectorLegacy(K2V3Detector):
     """
@@ -592,6 +680,7 @@ class ReasoningParser:
         "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
         "k2_v3": K2V3Detector,
+        "k2_v3_tracking": K2V3DetectorTracking,
         "k2_v3_legacy": K2V3DetectorLegacy,
     }
 
@@ -635,7 +724,7 @@ class ReasoningParser:
         # pops reasoning_effort out of chat_template_kwargs and promotes it to
         # request.reasoning_effort (see serving_chat.py); fall back to the
         # kwargs dict for callers that bypass that normalization.
-        if model_type.lower() in ("k2_v3", "k2_v3_legacy"):
+        if model_type.lower() in ("k2_v3", "k2_v3_tracking", "k2_v3_legacy"):
             effort = (
                 getattr(request, "reasoning_effort", None)
                 or chat_template_kwargs.get("reasoning_effort")
