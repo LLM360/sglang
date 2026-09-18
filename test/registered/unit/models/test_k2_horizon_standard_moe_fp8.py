@@ -180,9 +180,9 @@ def native_moe_model(monkeypatch, request):
         }
         print("K2 native branch before construction: " + json.dumps(observed))
         assert import_environment != "1", observed
-        assert (
-            observed["cpu_engine_after_native_import"] == import_environment
-        ), observed
+        assert observed["cpu_engine_after_native_import"] == import_environment, (
+            observed
+        )
         assert fused_moe_layer._is_cpu is False, observed
         assert fused_moe_layer._use_aiter is False, observed
         assert vocab_parallel_embedding._is_cpu is False, observed
@@ -564,7 +564,9 @@ def test_standard_moe_partial_update(native_moe_model, projection, suffix):
     model.load_weights(tensors.items())
     name = f"{EXPERT_PREFIX}.0.{projection}.{suffix}"
     value = 2 if suffix == "weight" else 0.125
-    tensors[name] = torch.full_like(tensors[name].float(), value).to(tensors[name].dtype)
+    tensors[name] = torch.full_like(tensors[name].float(), value).to(
+        tensors[name].dtype
+    )
     expected = _expected_routed_storage(tp, rank, ep)
     if suffix == "weight":
         expected["w13_weight"][0, :256, :] = value
