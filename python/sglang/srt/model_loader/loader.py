@@ -2675,6 +2675,10 @@ class PreshardedModelLoader(DefaultModelLoader):
             if self._verify_on_load:
                 self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
 
+            mark_load_complete = getattr(model, "mark_load_complete", None)
+            if mark_load_complete is not None:
+                mark_load_complete()
+
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
