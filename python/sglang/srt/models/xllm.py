@@ -1777,6 +1777,15 @@ class XllmForCausalLM(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_experts,
         )
+        self._dense_fp8_initial_load_pending = (
+            _is_k2_horizon_hf_checkpoint(config)
+            and config.num_experts == 0
+            and getattr(config, "num_values", 0) == 0
+            and quant_config is not None
+            and quant_config.get_name() == "compressed_tensors"
+            and quant_config.weight_block_size == [128, 128]
+            and any(p.dtype == torch.float8_e4m3fn for p in self.parameters())
+        )
 
     @torch.no_grad()
     def forward(
@@ -1809,6 +1818,23 @@ class XllmForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
+
+    def _dense_fp8_required_weights(self, params_dict):
+        required = {}
+        for name in params_dict:
+            if name == "lm_head.weight" and self.config.tie_word_embeddings:
+                required[name] = {"model.embed_tokens.weight"}
+                continue
+            required[name] = {
+                name.replace(param_name, weight_name)
+                for param_name, weight_name, _ in self.stacked_params_mapping
+                if param_name in name
+            } or {name}
+        return required
+
+    def post_load_weights(self):
+        """Record the end of a native load."""
+        self._dense_fp8_initial_load_pending = False
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         source_shapes = None
@@ -1862,6 +1888,13 @@ class XllmForCausalLM(nn.Module):
             )
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        dense_required = None
+        dense_pending = set()
+        if getattr(self, "_dense_fp8_initial_load_pending", False):
+            dense_required = self._dense_fp8_required_weights(params_dict)
+            dense_pending = {
+                name for names in dense_required.values() for name in names
+            }
         for name, loaded_weight in weights:
             checkpoint_name = name
             layer_id = get_layer_id(name)
@@ -1892,6 +1925,10 @@ class XllmForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                    if dense_required is not None:
+                        dense_pending.difference_update(
+                            dense_required.get("lm_head.weight", ())
+                        )
             if name == "lm_head.weight" and self.config.tie_word_embeddings:
                 continue
 
@@ -1924,6 +1961,7 @@ class XllmForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                dense_pending.discard(checkpoint_name)
                 break
             else:
                 for mapping in expert_params_mapping:
@@ -1966,12 +2004,21 @@ class XllmForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                    if dense_required is not None:
+                        dense_pending.difference_update(dense_required.get(name, ()))
 
         if source_shapes is not None and pending:
             raise ValueError(
                 f"MoVA FP8 initial load is missing {len(pending)} tensors; "
                 f"first missing tensor: {min(pending)}"
             )
+        if dense_pending:
+            raise ValueError(
+                f"Dense K2 FP8 initial load is missing {len(dense_pending)} tensors. "
+                f"First missing tensor: {min(dense_pending)}"
+            )
+        if dense_required is not None:
+            self.post_load_weights()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

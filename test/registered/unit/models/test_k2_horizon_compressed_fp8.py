@@ -18,6 +18,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -32,6 +33,8 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
 )
+from sglang.srt.model_loader.loader import _post_load_weights
+from sglang.srt.models import xllm
 from sglang.srt.models.xllm import K2HorizonForCausalLM
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -218,6 +221,129 @@ def test_dense_native_missing_tensor(monkeypatch, kind, missing):
         del tensors[name]
         with pytest.raises(ValueError, match=re.escape(name)):
             model.load_weights(tensors.items())
+
+
+def _assert_dense_expected(model, expected):
+    actual = dict(model.named_parameters())
+    assert actual.keys() == expected.keys()
+    for name, value in expected.items():
+        torch.testing.assert_close(actual[name].float(), value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "suffix", ("self_attn.q_proj.weight", "mlp.up_proj.weight_scale")
+)
+def test_dense_native_partial_update(monkeypatch, suffix):
+    with native_cpu_context(monkeypatch, tp=2, rank=1):
+        model, tensors = _model_and_tensors("7b")
+        model.load_weights(tensors.items())
+        name = f"model.layers.0.{suffix}"
+        tensors[name] = torch.full_like(tensors[name].float(), 2).to(tensors[name].dtype)
+        expected = _expected_storage(model.config, tensors, tp=2, rank=1)
+        model.load_weights([(name, tensors[name])])
+        _assert_dense_expected(model, expected)
+
+
+def test_dense_native_failed_load_stays_pending(monkeypatch):
+    with native_cpu_context(monkeypatch):
+        model, tensors = _model_and_tensors("7b")
+        name = "model.layers.0.self_attn.q_proj.weight"
+        incomplete = {key: value for key, value in tensors.items() if key != name}
+        with pytest.raises(ValueError, match=re.escape(name)):
+            model.load_weights(incomplete.items())
+        with pytest.raises(ValueError, match=re.escape("lm_head.weight")):
+            model.load_weights([(name, tensors[name])])
+        expected = _expected_storage(model.config, tensors, tp=1, rank=0)
+        model.load_weights(tensors.items())
+        _assert_dense_expected(model, expected)
+
+
+def test_dense_native_packed_initial_load(monkeypatch):
+    with native_cpu_context(monkeypatch):
+        model, tensors = _model_and_tensors("7b")
+        expected = _expected_storage(model.config, tensors, tp=1, rank=0)
+        for packed, projections in (
+            (
+                "self_attn.qkv_proj",
+                ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"),
+            ),
+            ("mlp.gate_up_proj", ("mlp.gate_proj", "mlp.up_proj")),
+        ):
+            for suffix in ("weight", "weight_scale"):
+                values = [
+                    tensors.pop(f"model.layers.0.{projection}.{suffix}")
+                    for projection in projections
+                ]
+                tensors[f"model.layers.0.{packed}.{suffix}"] = torch.cat(
+                    [value.float() for value in values], dim=0
+                ).to(values[0].dtype)
+        model.load_weights(tensors.items())
+        _assert_dense_expected(model, expected)
+
+
+def test_dense_native_fill_completion_allows_update(monkeypatch):
+    with native_cpu_context(monkeypatch):
+        model, tensors = _model_and_tensors("7b")
+        expected = _expected_storage(model.config, tensors, tp=1, rank=0)
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                parameter.copy_(expected[name].to(parameter.dtype))
+        _post_load_weights(model)
+        name = "model.layers.0.mlp.up_proj.weight_scale"
+        tensors[name] = torch.full_like(tensors[name], 2)
+        expected = _expected_storage(model.config, tensors, tp=1, rank=0)
+        model.load_weights([(name, tensors[name])])
+        _assert_dense_expected(model, expected)
+
+
+@pytest.mark.parametrize("rank", (0, 1), ids=("pp-first", "pp-last"))
+def test_dense_native_tied_pp_ownership(monkeypatch, rank):
+    with native_cpu_context(monkeypatch), monkeypatch.context() as patch:
+        group = SimpleNamespace(
+            world_size=2,
+            rank_in_group=rank,
+            is_first_rank=rank == 0,
+            is_last_rank=rank == 1,
+        )
+        patch.setattr(xllm, "get_pp_group", lambda: group)
+        config = _small_config("7b")
+        config.num_hidden_layers = 2
+        config.mlp_only_layers = [0, 1]
+        config.tie_word_embeddings = True
+        metadata = copy.deepcopy(config.quantization_config)
+        metadata["packed_modules_mapping"] = copy.deepcopy(
+            K2HorizonForCausalLM.packed_modules_mapping
+        )
+        model = K2HorizonForCausalLM(
+            config, quant_config=CompressedTensorsConfig.from_config(metadata)
+        )
+        tensors = _source_tensors(config)
+        expected = _expected_storage(config, tensors, tp=1, rank=0)
+        expected["lm_head.weight"] = tensors["model.embed_tokens.weight"].float().clone()
+        tensors.update(
+            {
+                name.replace("layers.0.", "layers.1."): value
+                for name, value in tuple(tensors.items())
+                if name.startswith("model.layers.0.")
+            }
+        )
+        prefix = f"model.layers.{rank}."
+        owned = {
+            name: value
+            for name, value in tensors.items()
+            if name.startswith(prefix)
+            or name == "model.embed_tokens.weight"
+            or (rank == 1 and name == "model.norm.weight")
+        }
+        expected = {
+            name.replace("layers.0.", f"layers.{rank}."): value
+            for name, value in expected.items()
+            if name.startswith("model.layers.0.")
+            or (rank == 0 and name == "model.embed_tokens.weight")
+            or (rank == 1 and name in ("lm_head.weight", "model.norm.weight"))
+        }
+        model.load_weights(owned.items())
+        _assert_dense_expected(model, expected)
 
 
 if __name__ == "__main__":
