@@ -1835,6 +1835,8 @@ class XllmForCausalLM(nn.Module):
     def mark_load_complete(self):
         """Record the end of a native load without changing tensor data."""
         self._dense_fp8_initial_load_pending = False
+        if getattr(self, "_mova_fp8_initial_load_only", False):
+            self._mova_fp8_load_started = True
 
     def post_load_weights(self):
         """Record the end of a native load."""
