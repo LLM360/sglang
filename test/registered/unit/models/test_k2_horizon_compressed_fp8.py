@@ -238,7 +238,9 @@ def test_dense_native_partial_update(monkeypatch, suffix):
         model, tensors = _model_and_tensors("7b")
         model.load_weights(tensors.items())
         name = f"model.layers.0.{suffix}"
-        tensors[name] = torch.full_like(tensors[name].float(), 2).to(tensors[name].dtype)
+        tensors[name] = torch.full_like(tensors[name].float(), 2).to(
+            tensors[name].dtype
+        )
         expected = _expected_storage(model.config, tensors, tp=2, rank=1)
         model.load_weights([(name, tensors[name])])
         _assert_dense_expected(model, expected)
@@ -319,7 +321,9 @@ def test_dense_native_tied_pp_ownership(monkeypatch, rank):
         )
         tensors = _source_tensors(config)
         expected = _expected_storage(config, tensors, tp=1, rank=0)
-        expected["lm_head.weight"] = tensors["model.embed_tokens.weight"].float().clone()
+        expected["lm_head.weight"] = (
+            tensors["model.embed_tokens.weight"].float().clone()
+        )
         tensors.update(
             {
                 name.replace("layers.0.", "layers.1."): value
