@@ -447,6 +447,8 @@ def test_standard_moe_native_storage(native_moe_model):
 
 def test_standard_moe_bf16_exclusions(native_moe_model):
     model, tp, rank, _ = native_moe_model
+    mlp = model.model.layers[3].mlp
+    assert mlp.topk.topk_config.correction_bias is mlp.gate.bias
     tensors = _source_tensors()
     expected = _expected_bf16_storage(tp, rank)
     model.load_weights(tensors.items())
@@ -548,6 +550,97 @@ def test_standard_moe_missing_remote_expert(native_moe_model, owner):
         expected = _expected_routed_storage(tp, rank, ep)
         model.load_weights(tensors.items())
         _assert_routed_storage(model, expected)
+
+
+@pytest.mark.parametrize(
+    ("native_moe_model", "projection", "suffix"),
+    [((2, 1, 1), "gate_proj", "weight"), ((2, 1, 1), "up_proj", "weight_scale")],
+    ids=("gate-weight", "up-scale"),
+    indirect=["native_moe_model"],
+)
+def test_standard_moe_partial_update(native_moe_model, projection, suffix):
+    model, tp, rank, ep = native_moe_model
+    tensors = _source_tensors()
+    model.load_weights(tensors.items())
+    name = f"{EXPERT_PREFIX}.0.{projection}.{suffix}"
+    value = 2 if suffix == "weight" else 0.125
+    tensors[name] = torch.full_like(tensors[name].float(), value).to(tensors[name].dtype)
+    expected = _expected_routed_storage(tp, rank, ep)
+    if suffix == "weight":
+        expected["w13_weight"][0, :256, :] = value
+    else:
+        expected["w13_weight_scale"][0, 2:, :] = value
+    model.load_weights([(name, tensors[name])])
+    _assert_routed_storage(model, expected)
+    _assert_bf16_storage(model, _expected_bf16_storage(tp, rank))
+
+
+def test_standard_moe_failed_load_stays_pending(native_moe_model):
+    model, tp, rank, ep = native_moe_model
+    tensors = _source_tensors()
+    name = f"{EXPERT_PREFIX}.0.gate_proj.weight"
+    incomplete = {key: value for key, value in tensors.items() if key != name}
+    with pytest.raises(ValueError, match=re.escape(name)):
+        model.load_weights(incomplete.items())
+    missing = f"{EXPERT_PREFIX}.0.down_proj.weight"
+    with pytest.raises(ValueError, match=re.escape(missing)):
+        model.load_weights([(name, tensors[name])])
+    expected = _expected_routed_storage(tp, rank, ep)
+    model.load_weights(tensors.items())
+    _assert_routed_storage(model, expected)
+    _assert_bf16_storage(model, _expected_bf16_storage(tp, rank))
+
+
+@pytest.mark.parametrize(
+    "native_moe_model", [(2, 1, 2)], ids=("ep2-r1",), indirect=True
+)
+def test_standard_moe_presharded_restore_allows_update(
+    native_moe_model, monkeypatch, tmp_path
+):
+    import test_k2_horizon_compressed_fp8 as dense_tests
+
+    from sglang.srt.configs.device_config import DeviceConfig
+    from sglang.srt.model_loader import loader as model_loader
+
+    print(
+        "K2 presharded providers: "
+        + json.dumps(
+            {
+                "tests": _source_identity(dense_tests),
+                "loader": _source_identity(model_loader),
+            }
+        )
+    )
+    model, tp, rank, ep = native_moe_model
+    expected = _expected_routed_storage(tp, rank, ep)
+    bf16_expected = _expected_bf16_storage(tp, rank)
+    all_expected = dict(bf16_expected)
+    all_expected.update(
+        {f"{EXPERT_PREFIX}.{name}": value for name, value in expected.items()}
+    )
+    parameters = dict(model.named_parameters())
+    assert parameters.keys() == all_expected.keys()
+    weights = {
+        name: all_expected[name].to(parameter.dtype)
+        for name, parameter in parameters.items()
+    }
+    monkeypatch.setattr(
+        model, "post_load_weights", dense_tests._reject_post_load_transform
+    )
+    loader, config = dense_tests._prepare_presharded_restore(
+        monkeypatch, tmp_path, model, weights
+    )
+    restored = loader.load_model(model_config=config, device_config=DeviceConfig("cpu"))
+    assert restored is model
+    assert model.training is False
+    _assert_routed_storage(model, expected)
+    _assert_bf16_storage(model, bf16_expected)
+    name = f"{EXPERT_PREFIX}.3.down_proj.weight_scale"
+    replacement = torch.full((6, 4), 0.125, dtype=torch.bfloat16)
+    expected["w2_weight_scale"][1, :, :] = 0.125
+    model.load_weights([(name, replacement)])
+    _assert_routed_storage(model, expected)
+    _assert_bf16_storage(model, bf16_expected)
 
 
 if __name__ == "__main__":
