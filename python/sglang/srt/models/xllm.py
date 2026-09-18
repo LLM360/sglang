@@ -37,7 +37,10 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location import (
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
@@ -922,6 +925,20 @@ class XllmMoEGate(nn.Module):
         ).float()
 
 
+def _is_k2_standard_moe_fp8(config, experts) -> bool:
+    return (
+        _is_k2_horizon_hf_checkpoint(config)
+        and getattr(config, "num_values", 0) == 0
+        and experts.quant_config is not None
+        and experts.quant_config.get_name() == "compressed_tensors"
+        and getattr(experts, "weight_block_size", None) == [128, 128]
+        and experts.w13_weight.dtype == torch.float8_e4m3fn
+        and experts.w2_weight.dtype == torch.float8_e4m3fn
+        and experts.w13_input_scale is None
+        and experts.w2_input_scale is None
+    )
+
+
 class XllmSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -974,6 +991,9 @@ class XllmSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.RenormalizeNaive,
         )
+
+        if _is_k2_standard_moe_fp8(config, self.experts) and self.gate.bias is not None:
+            self.gate.bias.data = torch.empty_like(self.gate.bias, dtype=torch.bfloat16)
 
         # Shared expert (no gating — output added directly)
         num_shared_experts = getattr(config, "num_shared_experts", 0)
@@ -1786,6 +1806,11 @@ class XllmForCausalLM(nn.Module):
             and quant_config.weight_block_size == [128, 128]
             and any(p.dtype == torch.float8_e4m3fn for p in self.parameters())
         )
+        self._standard_moe_fp8_initial_load_pending = any(
+            _is_k2_standard_moe_fp8(config, module.experts)
+            for module in self.modules()
+            if isinstance(module, XllmSparseMoeBlock)
+        )
 
     @torch.no_grad()
     def forward(
@@ -1832,9 +1857,57 @@ class XllmForCausalLM(nn.Module):
             } or {name}
         return required
 
+    def _standard_moe_fp8_source_shapes(self):
+        shapes = {}
+        location = get_global_expert_location_metadata()
+        for prefix, module in self.named_modules():
+            if not isinstance(module, XllmSparseMoeBlock):
+                continue
+            experts = module.experts
+            if not _is_k2_standard_moe_fp8(self.config, experts):
+                continue
+            width = self.config.moe_intermediate_size
+            if experts.use_presharded_weights:
+                width //= experts.moe_tp_size
+            for name, parameter in experts.named_parameters(recurse=False):
+                native_name = f"{prefix}.experts.{name}"
+                require_global = getattr(
+                    parameter, "_sglang_require_global_experts", False
+                )
+                for mapping in self.expert_params_mapping:
+                    param_name, source_name, expert_id, shard_id = mapping
+                    if param_name not in native_name:
+                        continue
+                    physical_ids = (
+                        [expert_id]
+                        if location is None
+                        else location.logical_to_all_physical(
+                            experts.layer_id, expert_id, require_global
+                        )
+                    )
+                    if not any(
+                        require_global
+                        or experts._map_global_expert_id_to_local_expert_id(index) >= 0
+                        for index in physical_ids
+                    ):
+                        continue
+                    shape = [width, experts.hidden_size_unpadded]
+                    if shard_id == "w2":
+                        shape.reverse()
+                    if name.endswith("weight_scale"):
+                        shape = [
+                            (size + block - 1) // block
+                            for size, block in zip(
+                                shape, experts.weight_block_size, strict=True
+                            )
+                        ]
+                    shapes[native_name.replace(param_name, source_name)] = tuple(shape)
+        return shapes
+
     def mark_load_complete(self):
         """Record the end of a native load without changing tensor data."""
         self._dense_fp8_initial_load_pending = False
+        self._standard_moe_fp8_initial_load_pending = False
 
     def post_load_weights(self):
         """Record the end of a native load."""
@@ -1899,6 +1972,12 @@ class XllmForCausalLM(nn.Module):
             dense_pending = {
                 name for names in dense_required.values() for name in names
             }
+        moe_shapes = (
+            self._standard_moe_fp8_source_shapes()
+            if getattr(self, "_standard_moe_fp8_initial_load_pending", False)
+            else None
+        )
+        moe_pending = set(moe_shapes or ())
         for name, loaded_weight in weights:
             checkpoint_name = name
             layer_id = get_layer_id(name)
@@ -1974,6 +2053,13 @@ class XllmForCausalLM(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
                     param = params_dict[name]
+                    if moe_shapes is not None and checkpoint_name in moe_shapes:
+                        expected = moe_shapes[checkpoint_name]
+                        if tuple(loaded_weight.shape) != expected:
+                            raise ValueError(
+                                f"K2 FP8 tensor {checkpoint_name!r} has shape "
+                                f"{tuple(loaded_weight.shape)}. Expected {expected}."
+                            )
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -1982,6 +2068,7 @@ class XllmForCausalLM(nn.Module):
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
+                    moe_pending.discard(checkpoint_name)
                     break
                 else:
                     if is_pipeline_missing_weight(name):
@@ -2021,7 +2108,13 @@ class XllmForCausalLM(nn.Module):
                 f"Dense K2 FP8 initial load is missing {len(dense_pending)} tensors. "
                 f"First missing tensor: {min(dense_pending)}"
             )
-        if dense_required is not None:
+        if moe_pending:
+            raise ValueError(
+                "Standard-MoE K2 FP8 initial load is missing "
+                f"{len(moe_pending)} tensors. "
+                f"First missing tensor: {min(moe_pending)}"
+            )
+        if dense_required is not None or moe_shapes is not None:
             self.post_load_weights()
 
     @classmethod
