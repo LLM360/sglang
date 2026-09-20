@@ -112,6 +112,33 @@ class TestBiasedGroupedTopK(CustomTestCase):
 
 
 class TestTopK(CustomTestCase):
+    def test_native_biased_sigmoid_routes_in_fp32(self):
+        hidden_states = torch.zeros(1, 4, dtype=torch.bfloat16)
+        gating_output = torch.tensor(
+            [[0.0, 0.00390625]], dtype=torch.bfloat16
+        )
+        correction_bias = torch.tensor([0.0005, 0.0], dtype=torch.float32)
+
+        topk_weights, topk_ids = native_fused_topk(
+            hidden_states,
+            gating_output,
+            topk=1,
+            renormalize=True,
+            correction_bias=correction_bias,
+            scoring_func="sigmoid",
+        )
+
+        scores = torch.sigmoid(gating_output.float())
+        expected_ids = torch.topk(
+            scores + correction_bias.unsqueeze(0), k=1, dim=-1, sorted=False
+        )[1]
+        expected_weights = scores.gather(1, expected_ids)
+        expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+
+        self.assertEqual(topk_weights.dtype, torch.float32)
+        torch.testing.assert_close(topk_ids, expected_ids)
+        torch.testing.assert_close(topk_weights, expected_weights)
+
     def _run_single_test(self, M, E, topk, renormalize, dtype):
         torch.manual_seed(1998)
 
