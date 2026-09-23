@@ -136,7 +136,7 @@ class RoutedExpertsCapturer(ABC):
     ):
         raise NotImplementedError
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor):
+    def capture(self, layer_id: int, topk_ids: torch.Tensor, *, is_value: bool = False):
         raise NotImplementedError
 
     def get_routed_experts(
@@ -144,6 +144,8 @@ class RoutedExpertsCapturer(ABC):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        *,
+        is_value: bool = False,
     ):
         raise NotImplementedError
 
@@ -186,6 +188,24 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             device=device,
         )
 
+        self.value_host_cache = self.value_device_cache = None
+        config = model_config.hf_text_config
+        if getattr(config, "num_values", 0) > 0:
+            self.num_dense_layers = config.num_dense_layers
+            num_value_layers = self.num_hidden_layers - self.num_dense_layers
+            self.value_host_cache = _RoutedExpertsHostCache(
+                num_tokens=num_tokens,
+                num_hidden_layers=num_value_layers,
+                num_experts_per_tok=config.num_values_per_tok,
+            )
+            self.value_device_cache = _RoutedExpertsDeviceCache(
+                max_running_requests=max_running_requests,
+                num_hidden_layers=num_value_layers,
+                num_experts_per_tok=config.num_values_per_tok,
+                num_fused_shared_experts=0,
+                device=device,
+            )
+
         if get_moe_a2a_backend().is_deepep():
             attn_tp_size = get_attention_tp_size() if is_dp_attention_enabled() else 1
             self.gather_buffer = torch.empty(
@@ -222,8 +242,18 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self.host_cache.buffer[out_cache_loc_cpu] = self.device_cache.buffer[
             local_start_pos:local_end_pos, :, : self.num_experts_per_tok
         ].cpu()
+        if self.value_host_cache is not None:
+            # Attention routing already contains only this DP rank's tokens.
+            self.value_host_cache.buffer[out_cache_loc_cpu] = (
+                self.value_device_cache.buffer[: len(out_cache_loc_cpu)].cpu()
+            )
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor):
+    def capture(self, layer_id: int, topk_ids: torch.Tensor, *, is_value: bool = False):
+        if is_value:
+            self.value_device_cache.capture_fwd_routed_experts(
+                layer_id - self.num_dense_layers, topk_ids
+            )
+            return
         if get_moe_a2a_backend().is_deepep():
             local_topk_ids = topk_ids
             topk_ids = self.gather_buffer[
@@ -237,11 +267,16 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        *,
+        is_value: bool = False,
     ):
+        cache = self.value_host_cache if is_value else self.host_cache
+        if cache is None:
+            return None
         cache_pool_idx = (
             req_to_token_pool.req_to_token[req_pool_idx][: seqlen - 1].cpu().clone()
         )
-        return self.get_host_cache().buffer[cache_pool_idx]
+        return cache.buffer[cache_pool_idx]
 
     def on_forward_end(self, forward_batch, can_run_graph, cuda_graph_batch):
         self._sync_fwd_experts_buffer_DtoH(
@@ -269,7 +304,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     ):
         pass
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor):
+    def capture(self, layer_id: int, topk_ids: torch.Tensor, *, is_value: bool = False):
         pass
 
     def get_routed_experts(
@@ -277,6 +312,8 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        *,
+        is_value: bool = False,
     ):
         pass
 
