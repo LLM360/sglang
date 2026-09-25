@@ -801,6 +801,7 @@ class Req(ReqDllmMixin):
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
+        self.routed_value_experts: Optional[torch.Tensor] = None
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
 
@@ -1200,6 +1201,7 @@ class Req(ReqDllmMixin):
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
+        self.routed_value_experts = None
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0

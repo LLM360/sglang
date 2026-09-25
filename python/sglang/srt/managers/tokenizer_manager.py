@@ -1631,11 +1631,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
-            if getattr(recv_obj, "routed_experts", None):
-                routed_experts_tensor = recv_obj.routed_experts[i]
-                if routed_experts_tensor is not None:
-                    meta_info["routed_experts"] = pybase64.b64encode(
-                        routed_experts_tensor.numpy().tobytes()
+            for field in ("routed_experts", "routed_value_experts"):
+                routes = getattr(recv_obj, field, None)
+                if routes and routes[i] is not None:
+                    meta_info[field] = pybase64.b64encode(
+                        routes[i].numpy().tobytes()
                     ).decode("utf-8")
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():

@@ -137,6 +137,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.mova import RoutedValueExperts, mova_router_topk
 
@@ -1110,6 +1111,7 @@ class XllmMoVAAttention(_XllmMoVAAttentionBase):
         prefix: str = "",
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
+        self.layer_id = layer_id
         self.num_values = config.num_values
         self.num_values_per_tok = config.num_values_per_tok
         self.router_score_func = getattr(config, "router_score_func", "sigmoid")
@@ -1156,6 +1158,9 @@ class XllmMoVAAttention(_XllmMoVAAttentionBase):
             top_k=self.num_values_per_tok,
             scaling_factor=self.router_scaling_factor,
             renormalize=self.renormalize,
+        )
+        get_global_experts_capturer().capture(
+            layer_id=self.layer_id, topk_ids=selected_values, is_value=True
         )
         return self.v_experts(hidden_states, routing_weights, selected_values)
 

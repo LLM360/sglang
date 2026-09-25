@@ -755,7 +755,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
-                routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                routed_experts[index] = process_routed_experts_from_ret(content, request)
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -955,9 +955,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
             if request.return_routed_experts and routed_experts:
-                # Get first non-None routed_experts value
+                # Keep both routing fields from the same response.
                 first_routed_experts = next(
-                    (v for v in routed_experts.values() if v is not None), None
+                    (v for v in routed_experts.values() if v), None
                 )
                 if first_routed_experts is not None:
                     routed_experts_chunk = ChatCompletionStreamResponse(
@@ -965,7 +965,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         created=int(time.time()),
                         choices=[],  # sglext is at response level
                         model=request.model,
-                        sglext=SglExt(routed_experts=first_routed_experts),
+                        sglext=SglExt(**first_routed_experts),
                     )
                     yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
 
@@ -1039,7 +1039,7 @@ class OpenAIServingChat(OpenAIServingBase):
         response_sglext = None
         if routed_experts or cached_tokens_details:
             response_sglext = SglExt(
-                routed_experts=routed_experts,
+                **routed_experts,
                 cached_tokens_details=cached_tokens_details,
             )
 
