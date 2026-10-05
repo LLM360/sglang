@@ -436,6 +436,7 @@ class ServerArgs:
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
+    no_cache_thoughts: bool = False
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
@@ -4507,6 +4508,17 @@ class ServerArgs:
             choices=list(ReasoningParser.DetectorMap.keys()),
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
+        )
+        parser.add_argument(
+            "--no-cache-thoughts",
+            action="store_true",
+            default=ServerArgs.no_cache_thoughts,
+            help=(
+                "Skip inserting reasoning (thought) tokens into the shared prefix cache. "
+                "Answer tokens after </think> are inserted with their original RoPE positions "
+                "preserved so that thought-infused K/V representations remain reusable across "
+                "turns. Requires --reasoning-parser."
+            ),
         )
         tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
         parser.add_argument(

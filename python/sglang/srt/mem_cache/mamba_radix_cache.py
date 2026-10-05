@@ -514,8 +514,18 @@ class MambaRadixCache(BasePrefixCache):
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
-        """Cache request when it finishes."""
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, split=None
+    ) -> None:
+        """Cache request when it finishes.
+
+        MambaRadixCache does not yet implement split insertion; when --no-cache-thoughts
+        passes a split, fall back to the default behavior (thoughts cached normally).
+        """
+        if split is not None:
+            from sglang.srt.mem_cache.common import warn_split_unsupported_once
+
+            warn_split_unsupported_once("MambaRadixCache")
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[

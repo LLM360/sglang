@@ -1805,7 +1805,6 @@ class Scheduler(
                 return_sampling_mask=recv_req.return_sampling_mask,
             )
             req.tokenizer = self.tokenizer
-
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if (

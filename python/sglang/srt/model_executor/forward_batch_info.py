@@ -544,7 +544,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
-                ret.positions = clamp_position(batch.seq_lens)
+                ret.positions = clamp_position(
+                    batch.seq_lens,
+                    position_offsets=getattr(batch, "position_offsets", None),
+                )
         else:
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
@@ -555,11 +558,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
-            positions, ret.extend_start_loc = compute_position(
-                model_runner.server_args.attention_backend,
-                ret.extend_prefix_lens,
-                ret.extend_seq_lens,
-                ret.extend_num_tokens,
+            # Honor per-request cached non-contiguous positions from cache hits when
+            # available; otherwise behaves identically to compute_position.
+            positions, ret.extend_start_loc = build_extend_positions(
+                attn_backend=model_runner.server_args.attention_backend,
+                extend_prefix_lens=ret.extend_prefix_lens,
+                extend_seq_lens=ret.extend_seq_lens,
+                extend_num_tokens=ret.extend_num_tokens,
+                extend_prefix_lens_cpu=batch.extend_prefix_lens,
+                cached_positions_per_req=getattr(
+                    batch, "cached_positions_per_req", None
+                ),
+                device=device,
             )
             if ret.positions is None:
                 ret.positions = positions
@@ -1100,13 +1110,63 @@ class PPProxyTensors:
         return f"PPProxyTensors(tensors={self.tensors})"
 
 
+def build_extend_positions(
+    attn_backend: str,
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_num_tokens: int,
+    extend_prefix_lens_cpu: List[int],
+    cached_positions_per_req: Optional[List[Optional[torch.Tensor]]],
+    device,
+):
+    """Build extend-token positions, honoring per-request cached non-contiguous positions.
+
+    Returns (positions, extend_start_loc) matching compute_position's signature. When
+    cached_positions_per_req is None or contains only None entries, positions are
+    contiguous (legacy behavior). Otherwise the per-request start position is
+    max(cached_positions[i]) + 1 for cached requests, and extend_prefix_lens_cpu[i]
+    for non-cached requests.
+    """
+    from sglang.srt.mem_cache.common import derive_extend_position_start
+
+    extend_position_start_tensor = None
+    if cached_positions_per_req is not None:
+        starts = derive_extend_position_start(
+            extend_prefix_lens_cpu, cached_positions_per_req
+        )
+        if starts is not None:
+            extend_position_start_tensor = torch.tensor(
+                starts, dtype=torch.int64
+            ).to(device, non_blocking=True)
+
+    return compute_position(
+        attn_backend,
+        extend_prefix_lens,
+        extend_seq_lens,
+        extend_num_tokens,
+        extend_position_start=extend_position_start_tensor,
+    )
+
+
 def compute_position(
     attn_backend: str,
     extend_prefix_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
+    extend_position_start: Optional[torch.Tensor] = None,
 ):
-    if support_triton(attn_backend):
+    """Compute positions for the extend (prefill) tokens.
+
+    extend_position_start (optional): per-request override for the starting RoPE
+    position of the extend tokens. When None, positions are contiguous and start
+    at extend_prefix_lens[i]. When provided, positions for request i are
+    [extend_position_start[i], extend_position_start[i] + 1, ...]; used by cache
+    hits whose cached entries carry non-contiguous original positions.
+    """
+    if support_triton(attn_backend) and extend_position_start is None:
+        # The fused triton kernel uses extend_prefix_lens as the position start.
+        # The override path is not yet implemented there; fall through to the
+        # torch path when an override is requested.
         positions, extend_start_loc = compute_position_triton(
             extend_prefix_lens,
             extend_seq_lens,
@@ -1114,7 +1174,7 @@ def compute_position(
         )
     else:
         positions, extend_start_loc = compute_position_torch(
-            extend_prefix_lens, extend_seq_lens
+            extend_prefix_lens, extend_seq_lens, extend_position_start
         )
     return positions, extend_start_loc
 
@@ -1176,14 +1236,32 @@ def compute_position_kernel(
 
 
 def compute_position_torch(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_position_start: Optional[torch.Tensor] = None,
 ):
+    """Compute per-token positions for the extend (prefill) tokens of a batch.
+
+    Args:
+        extend_prefix_lens: per-request count of cached prefix tokens (KV slot count).
+        extend_seq_lens: per-request count of new tokens being prefilled.
+        extend_position_start: optional per-request override for the first RoPE
+            position of the extend tokens. When None, positions start at
+            extend_prefix_lens[i] (contiguous: token i sits at RoPE position i).
+            When provided, positions for request i are
+            [extend_position_start[i], extend_position_start[i] + 1, ...]. This
+            supports cache hits whose stored kv has non-contiguous positions
+            (e.g. with gaps where thoughts were skipped).
+    """
+    starts = (
+        extend_position_start if extend_position_start is not None else extend_prefix_lens
+    )
     positions = torch.cat(
         [
             torch.arange(
-                prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device
+                start, start + extend_len, device=extend_prefix_lens.device
             )
-            for prefix_len, extend_len in zip(extend_prefix_lens, extend_seq_lens)
+            for start, extend_len in zip(starts, extend_seq_lens)
         ],
         axis=0,
     )
@@ -1192,13 +1270,34 @@ def compute_position_torch(
     return positions.to(torch.int64), extend_start_loc
 
 
-def _clamp_position_native(seq_lens):
-    return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+def _clamp_position_native(seq_lens, position_offsets: Optional[torch.Tensor] = None):
+    """Per-token decode position = clamp(seq_lens - 1, 0).
+
+    Args:
+        seq_lens: per-request sequence length (token count).
+        position_offsets: optional per-request RoPE offset that shifts each
+            position. Used after a cache hit whose cached entry carried
+            non-contiguous RoPE positions: the offset is
+            max(cached_positions) - (prefix_token_count - 1), capturing the
+            gap in RoPE space caused by skipped thought tokens. When None,
+            behavior matches the legacy contiguous-positions path.
+    """
+    base = torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+    if position_offsets is not None:
+        base = base + position_offsets.to(torch.int64)
+    return base
 
 
 if is_cuda() or is_hip():
     from sglang.jit_kernel.clamp_position import clamp_position_cuda
 
-    clamp_position = clamp_position_cuda
+    def clamp_position(
+        seq_lens: torch.Tensor,
+        position_offsets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        base = clamp_position_cuda(seq_lens)
+        if position_offsets is not None:
+            base = base + position_offsets.to(torch.int64)
+        return base
 else:
     clamp_position = _clamp_position_native

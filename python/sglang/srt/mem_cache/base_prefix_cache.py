@@ -61,6 +61,13 @@ class InsertParams:
     chunked: bool = False
     priority: int = 0
 
+    # Per-token original RoPE positions for the inserted tokens. When None (default),
+    # the cache uses standard contiguous positions and behavior is unchanged. When
+    # provided, length must equal len(key.token_ids); positions are stored alongside
+    # the kv_indices so subsequent match_prefix calls can return them, letting the
+    # scheduler use non-contiguous positions in the ForwardBatch.
+    original_positions: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class InsertResult:
@@ -145,6 +152,7 @@ class MatchResult(NamedTuple):
     host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    original_positions: Optional[torch.Tensor] = None
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):

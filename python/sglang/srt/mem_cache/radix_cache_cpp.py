@@ -168,8 +168,16 @@ class RadixCacheCpp(BasePrefixCache):
     def total_size(self):
         return self.tree.total_size()
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
-        """Cache request when it finishes."""
+    def cache_finished_req(self, req: Req, is_insert: bool = True, split=None):
+        """Cache request when it finishes.
+
+        RadixCacheCpp does not yet implement split insertion; when --no-cache-thoughts
+        passes a split, fall back to the default behavior (thoughts cached normally).
+        """
+        if split is not None:
+            from sglang.srt.mem_cache.common import warn_split_unsupported_once
+
+            warn_split_unsupported_once("RadixCacheCpp")
         assert req.req_pool_idx is not None
         kv_committed_len = req.pop_committed_kv_cache()
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
