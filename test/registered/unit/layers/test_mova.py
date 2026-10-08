@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.moe.routed_experts_capturer import ExpertRoutingKind
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.mova import (
     RoutedValueExperts,
@@ -434,7 +435,7 @@ def test_value_top4_routes_match_native_mp2_at_real_shape_boundary(device, monke
     attention.v_experts = RecordingValueExperts()
     output = attention._project_value(hidden)
     assert captured["layer_id"] == 3
-    assert captured["is_value"] is True
+    assert captured["routing_kind"] is ExpertRoutingKind.MOVA_VALUE
     assert captured["topk_ids"] is seen["ids"]
     expected_weights, expected_ids = _native_router_topk_reference(
         native_logits,

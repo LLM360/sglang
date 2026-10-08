@@ -8,7 +8,10 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    ExpertRoutingKind,
+    get_global_experts_capturer,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -102,12 +105,13 @@ class SchedulerOutputProcessorMixin:
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
+            routing_kind=ExpertRoutingKind.FFN,
         )
         req.routed_value_experts = get_global_experts_capturer().get_routed_experts(
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
-            is_value=True,
+            routing_kind=ExpertRoutingKind.MOVA_VALUE,
         )
 
     def maybe_collect_customized_info(

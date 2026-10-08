@@ -1,3 +1,4 @@
+import enum
 import logging
 from abc import ABC
 from typing import Optional
@@ -25,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 _GB = 1024 * 1024 * 1024
 _MB = 1024 * 1024
+
+
+class ExpertRoutingKind(enum.Enum):
+    FFN = "ffn"
+    MOVA_VALUE = "mova_value"
 
 
 def get_tensor_size_bytes(t: torch.Tensor):
@@ -136,7 +142,13 @@ class RoutedExpertsCapturer(ABC):
     ):
         raise NotImplementedError
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor, *, is_value: bool = False):
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        *,
+        routing_kind: ExpertRoutingKind = ExpertRoutingKind.FFN,
+    ):
         raise NotImplementedError
 
     def get_routed_experts(
@@ -145,7 +157,7 @@ class RoutedExpertsCapturer(ABC):
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
         *,
-        is_value: bool = False,
+        routing_kind: ExpertRoutingKind = ExpertRoutingKind.FFN,
     ):
         raise NotImplementedError
 
@@ -248,10 +260,25 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 self.value_device_cache.buffer[: len(out_cache_loc_cpu)].cpu()
             )
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor, *, is_value: bool = False):
-        if is_value:
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        *,
+        routing_kind: ExpertRoutingKind = ExpertRoutingKind.FFN,
+    ):
+        if routing_kind is ExpertRoutingKind.MOVA_VALUE:
+            assert self.value_device_cache is not None, (
+                "MoVA value routing capture is not available for this model"
+            )
+            value_layer_id = layer_id - self.num_dense_layers
+            num_value_layers = self.value_device_cache.buffer.shape[1]
+            assert 0 <= value_layer_id < num_value_layers, (
+                f"value layer index {value_layer_id} is out of range for "
+                f"num_value_layers={num_value_layers}"
+            )
             self.value_device_cache.capture_fwd_routed_experts(
-                layer_id - self.num_dense_layers, topk_ids
+                value_layer_id, topk_ids
             )
             return
         if get_moe_a2a_backend().is_deepep():
@@ -268,9 +295,13 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
         *,
-        is_value: bool = False,
+        routing_kind: ExpertRoutingKind = ExpertRoutingKind.FFN,
     ):
-        cache = self.value_host_cache if is_value else self.host_cache
+        cache = (
+            self.value_host_cache
+            if routing_kind is ExpertRoutingKind.MOVA_VALUE
+            else self.host_cache
+        )
         if cache is None:
             return None
         cache_pool_idx = (
@@ -304,7 +335,13 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     ):
         pass
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor, *, is_value: bool = False):
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        *,
+        routing_kind: ExpertRoutingKind = ExpertRoutingKind.FFN,
+    ):
         pass
 
     def get_routed_experts(
@@ -313,7 +350,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
         *,
-        is_value: bool = False,
+        routing_kind: ExpertRoutingKind = ExpertRoutingKind.FFN,
     ):
         pass
 
@@ -339,11 +376,13 @@ def set_global_experts_capturer(capturer: RoutedExpertsCapturer):
     _global_expert_capturer = capturer
 
 
-def extract_routed_experts_from_meta_info(data):
+def extract_routed_experts_from_meta_info(data, field="routed_experts"):
     # To solve the performance issue, we return the experts_ids in base64
     # We left this function for user to change it back to normal int32
     # See detokenizer_manager::_extract_routed_experts
-    routed_experts_base64 = data["meta_info"].get("routed_experts", None)
+    routed_experts_base64 = data["meta_info"].get(field, None)
+    if routed_experts_base64 is None:
+        return None
     routed_experts = np.frombuffer(
         pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
     )

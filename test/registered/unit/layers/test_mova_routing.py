@@ -1,12 +1,17 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pybase64
 import pytest
 import torch
 
 from sglang.srt.entrypoints.openai.protocol import SglExt
 from sglang.srt.entrypoints.openai.utils import process_routed_experts_from_ret
 from sglang.srt.layers.moe import routed_experts_capturer as routing
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    ExpertRoutingKind,
+    extract_routed_experts_from_meta_info,
+)
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -52,7 +57,9 @@ def test_value_capture_uses_local_tokens_and_sparse_layers(monkeypatch, can_run_
     global_ffn[start:] = ffn
     for layer in (1, 2):
         capturer.capture(layer, global_ffn)
-        capturer.capture(layer, values + layer - 1, is_value=True)
+        capturer.capture(
+            layer, values + layer - 1, routing_kind=ExpertRoutingKind.MOVA_VALUE
+        )
     batch = SimpleNamespace(out_cache_loc=torch.tensor([7, 2]))
     capturer.on_forward_end(batch, can_run_graph, 4)
 
@@ -60,10 +67,16 @@ def test_value_capture_uses_local_tokens_and_sparse_layers(monkeypatch, can_run_
     batch.out_cache_loc = torch.tensor([9])
     monkeypatch.setattr(routing, "get_dp_local_info", lambda batch: (3, 1))
     for layer in (1, 2):
-        capturer.capture(layer, torch.tensor([[4]], dtype=torch.int32), is_value=True)
+        capturer.capture(
+            layer,
+            torch.tensor([[4]], dtype=torch.int32),
+            routing_kind=ExpertRoutingKind.MOVA_VALUE,
+        )
     capturer.on_forward_end(batch, can_run_graph, 4)
     pool = SimpleNamespace(req_to_token=torch.tensor([[7, 2, 9, 0]]))
-    result = capturer.get_routed_experts(0, 4, pool, is_value=True)
+    result = capturer.get_routed_experts(
+        0, 4, pool, routing_kind=ExpertRoutingKind.MOVA_VALUE
+    )
     assert result.tolist() == [[[5], [6]], [[6], [7]], [[4], [4]]]
     assert capturer.get_routed_experts(0, 3, pool)[:, 1].tolist() == [[1, 2], [3, 4]]
 
