@@ -1,6 +1,8 @@
+import dataclasses
+import enum
 import logging
 from abc import ABC
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import pybase64
@@ -25,6 +27,11 @@ logger = logging.getLogger(__name__)
 
 _GB = 1024 * 1024 * 1024
 _MB = 1024 * 1024
+
+
+class ExpertRoutingKind(enum.Enum):
+    FFN = "ffn"
+    MOVA_VALUE = "mova_value"
 
 
 def get_tensor_size_bytes(t: torch.Tensor):
@@ -107,6 +114,33 @@ class _RoutedExpertsHostCache:
         )
 
 
+@dataclasses.dataclass
+class RoutedIds:
+    ids: torch.Tensor
+    host_cache: "_RoutedExpertsHostCache"
+
+    def copy_to_cpu(self, non_blocking: bool = True):
+        self.ids = self.ids.to("cpu", non_blocking=non_blocking)
+
+    def scatter(self, out_cache_loc: torch.Tensor):
+        self.host_cache.buffer[out_cache_loc] = self.ids
+
+
+@dataclasses.dataclass
+class RoutedExpertsOutput:
+    out_cache_loc: torch.Tensor
+    streams: Dict[ExpertRoutingKind, RoutedIds]
+
+    def copy_to_cpu(self, non_blocking: bool = True):
+        self.out_cache_loc = self.out_cache_loc.to("cpu", non_blocking=non_blocking)
+        for stream in self.streams.values():
+            stream.copy_to_cpu(non_blocking)
+
+    def finalize(self):
+        for stream in self.streams.values():
+            stream.scatter(self.out_cache_loc)
+
+
 class RoutedExpertsCapturer(ABC):
     @staticmethod
     def create(
@@ -128,15 +162,13 @@ class RoutedExpertsCapturer(ABC):
         else:
             return _RoutedExpertsCapturerNoop()
 
-    def _sync_fwd_experts_buffer_DtoH(
+    def capture(
         self,
-        forward_batch: ForwardBatch,
-        can_run_graph: bool,
-        cuda_graph_batch: int,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        *,
+        routing_kind: ExpertRoutingKind = ExpertRoutingKind.FFN,
     ):
-        raise NotImplementedError
-
-    def capture(self, layer_id: int, topk_ids: torch.Tensor):
         raise NotImplementedError
 
     def get_routed_experts(
@@ -144,10 +176,18 @@ class RoutedExpertsCapturer(ABC):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        *,
+        routing_kind: ExpertRoutingKind = ExpertRoutingKind.FFN,
     ):
         raise NotImplementedError
 
-    def on_forward_end(self, forward_batch, can_run_graph, cuda_graph_batch):
+    def on_forward_end(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: int,
+        no_copy_to_cpu: bool = False,
+    ) -> Optional[RoutedExpertsOutput]:
         raise NotImplementedError
 
     def get_host_cache(self):
@@ -186,6 +226,24 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             device=device,
         )
 
+        self.value_host_cache = self.value_device_cache = None
+        config = model_config.hf_text_config
+        if getattr(config, "num_values", 0) > 0:
+            self.num_dense_layers = config.num_dense_layers
+            num_value_layers = self.num_hidden_layers - self.num_dense_layers
+            self.value_host_cache = _RoutedExpertsHostCache(
+                num_tokens=num_tokens,
+                num_hidden_layers=num_value_layers,
+                num_experts_per_tok=config.num_values_per_tok,
+            )
+            self.value_device_cache = _RoutedExpertsDeviceCache(
+                max_running_requests=max_running_requests,
+                num_hidden_layers=num_value_layers,
+                num_experts_per_tok=config.num_values_per_tok,
+                num_fused_shared_experts=0,
+                device=device,
+            )
+
         if get_moe_a2a_backend().is_deepep():
             attn_tp_size = get_attention_tp_size() if is_dp_attention_enabled() else 1
             self.gather_buffer = torch.empty(
@@ -197,12 +255,12 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 device=device,
             )
 
-    def _sync_fwd_experts_buffer_DtoH(
+    def _get_routing_streams(
         self,
         forward_batch: ForwardBatch,
         can_run_graph: bool,
         cuda_graph_batch: int,
-    ):
+    ) -> Dict[ExpertRoutingKind, RoutedIds]:
         # When DeepEP is enabled, capture() already does all_gather, so device_cache.buffer
         # contains data from all DP ranks. We should not slice by DP rank in this case.
         if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():
@@ -210,20 +268,46 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             # handle with cuda graph padding
             if can_run_graph:
                 local_start_pos = get_attention_dp_rank() * cuda_graph_batch
-                local_end_pos = local_start_pos + local_num_tokens
-            else:
-                local_end_pos = local_start_pos + local_num_tokens
+            local_end_pos = local_start_pos + local_num_tokens
         else:
             local_start_pos = 0
             local_end_pos = forward_batch.out_cache_loc.shape[0]
 
-        # FIXME: sync explicitly here, overlap scheduler breaks here.
-        out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
-        self.host_cache.buffer[out_cache_loc_cpu] = self.device_cache.buffer[
+        ffn_ids = self.device_cache.buffer[
             local_start_pos:local_end_pos, :, : self.num_experts_per_tok
-        ].cpu()
+        ]
+        streams = {ExpertRoutingKind.FFN: RoutedIds(ffn_ids, self.host_cache)}
+        if self.value_host_cache is not None:
+            # Attention routing already contains only this DP rank's tokens.
+            value_ids = self.value_device_cache.buffer[
+                : forward_batch.out_cache_loc.shape[0]
+            ]
+            streams[ExpertRoutingKind.MOVA_VALUE] = RoutedIds(
+                value_ids, self.value_host_cache
+            )
+        return streams
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor):
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        *,
+        routing_kind: ExpertRoutingKind = ExpertRoutingKind.FFN,
+    ):
+        if routing_kind is ExpertRoutingKind.MOVA_VALUE:
+            assert self.value_device_cache is not None, (
+                "MoVA value routing capture is not available for this model"
+            )
+            value_layer_id = layer_id - self.num_dense_layers
+            num_value_layers = self.value_device_cache.buffer.shape[1]
+            assert 0 <= value_layer_id < num_value_layers, (
+                f"value layer index {value_layer_id} is out of range for "
+                f"num_value_layers={num_value_layers}"
+            )
+            self.value_device_cache.capture_fwd_routed_experts(
+                value_layer_id, topk_ids
+            )
+            return
         if get_moe_a2a_backend().is_deepep():
             local_topk_ids = topk_ids
             topk_ids = self.gather_buffer[
@@ -237,18 +321,40 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        *,
+        routing_kind: ExpertRoutingKind = ExpertRoutingKind.FFN,
     ):
+        cache = (
+            self.value_host_cache
+            if routing_kind is ExpertRoutingKind.MOVA_VALUE
+            else self.host_cache
+        )
+        if cache is None:
+            return None
         cache_pool_idx = (
             req_to_token_pool.req_to_token[req_pool_idx][: seqlen - 1].cpu().clone()
         )
-        return self.get_host_cache().buffer[cache_pool_idx]
+        return cache.buffer[cache_pool_idx]
 
-    def on_forward_end(self, forward_batch, can_run_graph, cuda_graph_batch):
-        self._sync_fwd_experts_buffer_DtoH(
-            forward_batch=forward_batch,
-            can_run_graph=can_run_graph,
-            cuda_graph_batch=cuda_graph_batch,
+    def on_forward_end(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: int,
+        no_copy_to_cpu: bool = False,
+    ) -> Optional[RoutedExpertsOutput]:
+        streams = self._get_routing_streams(
+            forward_batch, can_run_graph, cuda_graph_batch
         )
+        output = RoutedExpertsOutput(
+            out_cache_loc=forward_batch.out_cache_loc,
+            streams=streams,
+        )
+        if no_copy_to_cpu:
+            return output
+        output.copy_to_cpu(non_blocking=False)
+        output.finalize()
+        return None
 
     def get_host_cache(self):
         return self.host_cache
@@ -261,15 +367,13 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     def __init__(self):
         pass
 
-    def _sync_fwd_experts_buffer_DtoH(
+    def capture(
         self,
-        forward_batch: ForwardBatch,
-        can_run_graph: bool,
-        cuda_graph_batch: int,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        *,
+        routing_kind: ExpertRoutingKind = ExpertRoutingKind.FFN,
     ):
-        pass
-
-    def capture(self, layer_id: int, topk_ids: torch.Tensor):
         pass
 
     def get_routed_experts(
@@ -277,11 +381,19 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        *,
+        routing_kind: ExpertRoutingKind = ExpertRoutingKind.FFN,
     ):
         pass
 
-    def on_forward_end(self, forward_batch, can_run_graph, cuda_graph_batch):
-        pass
+    def on_forward_end(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: int,
+        no_copy_to_cpu: bool = False,
+    ) -> Optional[RoutedExpertsOutput]:
+        return None
 
     def get_host_cache(self):
         pass
@@ -302,11 +414,13 @@ def set_global_experts_capturer(capturer: RoutedExpertsCapturer):
     _global_expert_capturer = capturer
 
 
-def extract_routed_experts_from_meta_info(data):
+def extract_routed_experts_from_meta_info(data, field="routed_experts"):
     # To solve the performance issue, we return the experts_ids in base64
     # We left this function for user to change it back to normal int32
     # See detokenizer_manager::_extract_routed_experts
-    routed_experts_base64 = data["meta_info"].get("routed_experts", None)
+    routed_experts_base64 = data["meta_info"].get(field, None)
+    if routed_experts_base64 is None:
+        return None
     routed_experts = np.frombuffer(
         pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
     )

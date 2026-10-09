@@ -8,7 +8,10 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    ExpertRoutingKind,
+    get_global_experts_capturer,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -96,10 +99,19 @@ class SchedulerOutputProcessorMixin:
 
     def maybe_collect_routed_experts(self: Scheduler, req: Req):
         """Collect routed experts for a finished request."""
+        if not req.return_routed_experts:
+            return
         req.routed_experts = get_global_experts_capturer().get_routed_experts(
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
+            routing_kind=ExpertRoutingKind.FFN,
+        )
+        req.routed_value_experts = get_global_experts_capturer().get_routed_experts(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+            routing_kind=ExpertRoutingKind.MOVA_VALUE,
         )
 
     def maybe_collect_customized_info(
@@ -145,6 +157,9 @@ class SchedulerOutputProcessorMixin:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            if result.routed_experts_output is not None:
+                result.routed_experts_output.finalize()
+                result.routed_experts_output = None
 
             (
                 logits_output,
@@ -394,6 +409,9 @@ class SchedulerOutputProcessorMixin:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        if result.routed_experts_output is not None:
+            result.routed_experts_output.finalize()
+            result.routed_experts_output = None
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
@@ -968,7 +986,9 @@ class SchedulerOutputProcessorMixin:
         retraction_counts = []
         output_hidden_states = None
         load = self.get_load()
-        routed_experts = None
+        return_routed_experts = any(req.return_routed_experts for req in reqs)
+        routed_experts = [] if return_routed_experts else None
+        routed_value_experts = [] if return_routed_experts else None
         customized_info = {}
         return_sampling_mask = any(req.return_sampling_mask for req in reqs)
         output_token_sampling_mask = [] if return_sampling_mask else None
@@ -1170,10 +1190,13 @@ class SchedulerOutputProcessorMixin:
                     if output_hidden_states is None:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
-                if req.return_routed_experts:
-                    if routed_experts is None:
-                        routed_experts = []
-                    routed_experts.append(req.routed_experts)
+                if return_routed_experts:
+                    routed_experts.append(
+                        req.routed_experts if req.return_routed_experts else None
+                    )
+                    routed_value_experts.append(
+                        req.routed_value_experts if req.return_routed_experts else None
+                    )
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
@@ -1232,6 +1255,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,
+                    routed_value_experts=routed_value_experts,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,

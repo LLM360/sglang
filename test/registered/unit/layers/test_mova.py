@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.moe.routed_experts_capturer import ExpertRoutingKind
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.mova import (
     RoutedValueExperts,
@@ -388,7 +389,7 @@ def test_ffn_top8_routes_match_native_mp2_at_real_shape_boundary(device):
         ),
     ],
 )
-def test_value_top4_routes_match_native_mp2_at_real_shape_boundary(device):
+def test_value_top4_routes_match_native_mp2_at_real_shape_boundary(device, monkeypatch):
     top_k = 4
     scaling_factor = 2.5
     hidden, weight, bias, native_logits, full_gemm_logits = (
@@ -400,6 +401,7 @@ def test_value_top4_routes_match_native_mp2_at_real_shape_boundary(device):
     )
     attention = object.__new__(XllmMoVAAttention)
     torch.nn.Module.__init__(attention)
+    attention.layer_id = 3
     attention.source_router_gemm_partitions = 2
     attention.router_score_func = "sigmoid"
     attention.router_scaling_factor = scaling_factor
@@ -415,6 +417,11 @@ def test_value_top4_routes_match_native_mp2_at_real_shape_boundary(device):
         attention.v_router.weight.copy_(weight)
 
     seen = {}
+    captured = {}
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.routed_experts_capturer._global_expert_capturer",
+        SimpleNamespace(capture=lambda **kwargs: captured.update(kwargs)),
+    )
 
     class RecordingValueExperts(torch.nn.Module):
         def forward(self, hidden_states, routing_weights, selected_values):
@@ -427,6 +434,9 @@ def test_value_top4_routes_match_native_mp2_at_real_shape_boundary(device):
 
     attention.v_experts = RecordingValueExperts()
     output = attention._project_value(hidden)
+    assert captured["layer_id"] == 3
+    assert captured["routing_kind"] is ExpertRoutingKind.MOVA_VALUE
+    assert captured["topk_ids"] is seen["ids"]
     expected_weights, expected_ids = _native_router_topk_reference(
         native_logits,
         bias,

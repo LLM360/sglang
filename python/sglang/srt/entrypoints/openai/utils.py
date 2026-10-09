@@ -97,11 +97,16 @@ def process_routed_experts_from_ret(
         ChatCompletionRequest,
         CompletionRequest,
     ],
-) -> Optional[str]:
-    """Process routed experts from a ret item in non-streaming response."""
+) -> Dict[str, str]:
+    """Extract requested FFN and MoVA routing fields for sglext."""
     if not getattr(request, "return_routed_experts", False):
-        return None
-    return ret_item["meta_info"].get("routed_experts", None)
+        return {}
+    meta_info = ret_item["meta_info"]
+    return {
+        field: meta_info[field]
+        for field in ("routed_experts", "routed_value_experts")
+        if meta_info.get(field) is not None
+    }
 
 
 def process_cached_tokens_details_from_ret(

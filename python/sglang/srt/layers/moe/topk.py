@@ -48,7 +48,10 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    ExpertRoutingKind,
+    get_global_experts_capturer,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -958,6 +961,7 @@ def _post_process_topk_ids(
     get_global_experts_capturer().capture(
         layer_id=layer_id,
         topk_ids=topk_ids,
+        routing_kind=ExpertRoutingKind.FFN,
     )
     if _is_cuda:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)

@@ -1021,6 +1021,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    # MoVA routes: (token, num_hidden_layers - num_dense_layers, num_values_per_tok).
+    routed_value_experts: Optional[List[Optional[torch.Tensor]]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1086,6 +1089,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    # MoVA routes: (token, num_hidden_layers - num_dense_layers, num_values_per_tok).
+    routed_value_experts: Optional[List[Optional[torch.Tensor]]] = None
+    
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
