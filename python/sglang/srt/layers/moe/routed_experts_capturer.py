@@ -1,7 +1,8 @@
+import dataclasses
 import enum
 import logging
 from abc import ABC
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import pybase64
@@ -113,6 +114,33 @@ class _RoutedExpertsHostCache:
         )
 
 
+@dataclasses.dataclass
+class RoutedIds:
+    ids: torch.Tensor
+    host_cache: "_RoutedExpertsHostCache"
+
+    def copy_to_cpu(self, non_blocking: bool = True):
+        self.ids = self.ids.to("cpu", non_blocking=non_blocking)
+
+    def scatter(self, out_cache_loc: torch.Tensor):
+        self.host_cache.buffer[out_cache_loc] = self.ids
+
+
+@dataclasses.dataclass
+class RoutedExpertsOutput:
+    out_cache_loc: torch.Tensor
+    streams: Dict[ExpertRoutingKind, RoutedIds]
+
+    def copy_to_cpu(self, non_blocking: bool = True):
+        self.out_cache_loc = self.out_cache_loc.to("cpu", non_blocking=non_blocking)
+        for stream in self.streams.values():
+            stream.copy_to_cpu(non_blocking)
+
+    def finalize(self):
+        for stream in self.streams.values():
+            stream.scatter(self.out_cache_loc)
+
+
 class RoutedExpertsCapturer(ABC):
     @staticmethod
     def create(
@@ -134,14 +162,6 @@ class RoutedExpertsCapturer(ABC):
         else:
             return _RoutedExpertsCapturerNoop()
 
-    def _sync_fwd_experts_buffer_DtoH(
-        self,
-        forward_batch: ForwardBatch,
-        can_run_graph: bool,
-        cuda_graph_batch: int,
-    ):
-        raise NotImplementedError
-
     def capture(
         self,
         layer_id: int,
@@ -161,7 +181,13 @@ class RoutedExpertsCapturer(ABC):
     ):
         raise NotImplementedError
 
-    def on_forward_end(self, forward_batch, can_run_graph, cuda_graph_batch):
+    def on_forward_end(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: int,
+        no_copy_to_cpu: bool = False,
+    ) -> Optional[RoutedExpertsOutput]:
         raise NotImplementedError
 
     def get_host_cache(self):
@@ -229,12 +255,12 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 device=device,
             )
 
-    def _sync_fwd_experts_buffer_DtoH(
+    def _get_routing_streams(
         self,
         forward_batch: ForwardBatch,
         can_run_graph: bool,
         cuda_graph_batch: int,
-    ):
+    ) -> Dict[ExpertRoutingKind, RoutedIds]:
         # When DeepEP is enabled, capture() already does all_gather, so device_cache.buffer
         # contains data from all DP ranks. We should not slice by DP rank in this case.
         if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():
@@ -242,23 +268,24 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             # handle with cuda graph padding
             if can_run_graph:
                 local_start_pos = get_attention_dp_rank() * cuda_graph_batch
-                local_end_pos = local_start_pos + local_num_tokens
-            else:
-                local_end_pos = local_start_pos + local_num_tokens
+            local_end_pos = local_start_pos + local_num_tokens
         else:
             local_start_pos = 0
             local_end_pos = forward_batch.out_cache_loc.shape[0]
 
-        # FIXME: sync explicitly here, overlap scheduler breaks here.
-        out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
-        self.host_cache.buffer[out_cache_loc_cpu] = self.device_cache.buffer[
+        ffn_ids = self.device_cache.buffer[
             local_start_pos:local_end_pos, :, : self.num_experts_per_tok
-        ].cpu()
+        ]
+        streams = {ExpertRoutingKind.FFN: RoutedIds(ffn_ids, self.host_cache)}
         if self.value_host_cache is not None:
             # Attention routing already contains only this DP rank's tokens.
-            self.value_host_cache.buffer[out_cache_loc_cpu] = (
-                self.value_device_cache.buffer[: len(out_cache_loc_cpu)].cpu()
+            value_ids = self.value_device_cache.buffer[
+                : forward_batch.out_cache_loc.shape[0]
+            ]
+            streams[ExpertRoutingKind.MOVA_VALUE] = RoutedIds(
+                value_ids, self.value_host_cache
             )
+        return streams
 
     def capture(
         self,
@@ -309,12 +336,25 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         )
         return cache.buffer[cache_pool_idx]
 
-    def on_forward_end(self, forward_batch, can_run_graph, cuda_graph_batch):
-        self._sync_fwd_experts_buffer_DtoH(
-            forward_batch=forward_batch,
-            can_run_graph=can_run_graph,
-            cuda_graph_batch=cuda_graph_batch,
+    def on_forward_end(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: int,
+        no_copy_to_cpu: bool = False,
+    ) -> Optional[RoutedExpertsOutput]:
+        streams = self._get_routing_streams(
+            forward_batch, can_run_graph, cuda_graph_batch
         )
+        output = RoutedExpertsOutput(
+            out_cache_loc=forward_batch.out_cache_loc,
+            streams=streams,
+        )
+        if no_copy_to_cpu:
+            return output
+        output.copy_to_cpu(non_blocking=False)
+        output.finalize()
+        return None
 
     def get_host_cache(self):
         return self.host_cache
@@ -325,14 +365,6 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
 
 class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     def __init__(self):
-        pass
-
-    def _sync_fwd_experts_buffer_DtoH(
-        self,
-        forward_batch: ForwardBatch,
-        can_run_graph: bool,
-        cuda_graph_batch: int,
-    ):
         pass
 
     def capture(
@@ -354,8 +386,14 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     ):
         pass
 
-    def on_forward_end(self, forward_batch, can_run_graph, cuda_graph_batch):
-        pass
+    def on_forward_end(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: int,
+        no_copy_to_cpu: bool = False,
+    ) -> Optional[RoutedExpertsOutput]:
+        return None
 
     def get_host_cache(self):
         pass

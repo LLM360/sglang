@@ -1,17 +1,13 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import pybase64
 import pytest
 import torch
 
 from sglang.srt.entrypoints.openai.protocol import SglExt
 from sglang.srt.entrypoints.openai.utils import process_routed_experts_from_ret
 from sglang.srt.layers.moe import routed_experts_capturer as routing
-from sglang.srt.layers.moe.routed_experts_capturer import (
-    ExpertRoutingKind,
-    extract_routed_experts_from_meta_info,
-)
+from sglang.srt.layers.moe.routed_experts_capturer import ExpertRoutingKind
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -60,6 +56,7 @@ def test_value_capture_uses_local_tokens_and_sparse_layers(monkeypatch, can_run_
         capturer.capture(
             layer, values + layer - 1, routing_kind=ExpertRoutingKind.MOVA_VALUE
         )
+
     batch = SimpleNamespace(out_cache_loc=torch.tensor([7, 2]))
     capturer.on_forward_end(batch, can_run_graph, 4)
 
@@ -79,6 +76,54 @@ def test_value_capture_uses_local_tokens_and_sparse_layers(monkeypatch, can_run_
     )
     assert result.tolist() == [[[5], [6]], [[6], [7]], [[4], [4]]]
     assert capturer.get_routed_experts(0, 3, pool)[:, 1].tolist() == [[1, 2], [3, 4]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a device copy")
+def test_routed_experts_output_snapshots_before_the_next_forward(monkeypatch):
+    config = SimpleNamespace(
+        num_hidden_layers=2,
+        num_dense_layers=1,
+        num_experts_per_tok=2,
+        num_values=8,
+        num_values_per_tok=1,
+    )
+    monkeypatch.setattr(
+        routing,
+        "get_global_server_args",
+        lambda: SimpleNamespace(chunked_prefill_size=4, dp_size=1),
+    )
+    monkeypatch.setattr(
+        routing, "get_moe_a2a_backend", lambda: SimpleNamespace(is_deepep=lambda: False)
+    )
+    monkeypatch.setattr(routing, "is_dp_attention_enabled", lambda: False)
+    capturer = routing.RoutedExpertsCapturer.create(
+        True, SimpleNamespace(hf_text_config=config), 1, 16, 4, "cuda"
+    )
+
+    def capture(ffn, values):
+        capturer.capture(1, torch.tensor([ffn], dtype=torch.int32, device="cuda"))
+        capturer.capture(
+            1,
+            torch.tensor([values], dtype=torch.int32, device="cuda"),
+            routing_kind=ExpertRoutingKind.MOVA_VALUE,
+        )
+
+    # FFN ids carry the fused shared expert column that the host cache drops.
+    capture([1, 2, 99], [5])
+    batch = SimpleNamespace(out_cache_loc=torch.tensor([7]))
+    output = capturer.on_forward_end(batch, False, None, no_copy_to_cpu=True)
+    output.copy_to_cpu()
+
+    # next forward overwrites the device buffers before finalize() runs.
+    capture([8, 9, 99], [6])
+    torch.cuda.synchronize()
+    output.finalize()
+
+    pool = SimpleNamespace(req_to_token=torch.tensor([[7, 0]]))
+    assert capturer.get_routed_experts(0, 2, pool)[:, 1].tolist() == [[1, 2]]
+    assert capturer.get_routed_experts(
+        0, 2, pool, routing_kind=ExpertRoutingKind.MOVA_VALUE
+    ).tolist() == [[[5]]]
 
 
 @pytest.mark.parametrize("opt_in", [(False, True), (True, False), (False, False)])
